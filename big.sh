@@ -74,31 +74,6 @@ kill_process() {
     echo "ACCESS DENIED — try: sudo bash lol_sender.sh"
 }
 
-# ── Send JSON using python3 (built-in on macOS, handles the 8-byte header correctly) ──
-send_payload() {
-    local ip="$1" port="$2" json="$3"
-    python3 - "$ip" "$port" "$json" <<'PYEOF'
-import sys, socket, json as _json
-
-ip   = sys.argv[1]
-port = int(sys.argv[2])
-data = sys.argv[3].encode("utf-8")
-
-try:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(10)
-        s.connect((ip, port))
-        s.sendall(len(data).to_bytes(8, "big") + data)
-    print("ok")
-except ConnectionRefusedError:
-    print(f"fail:refused")
-except socket.timeout:
-    print("fail:timeout")
-except OSError as e:
-    print(f"fail:{e}")
-PYEOF
-}
-
 # ── Collect process info and build JSON ───────────────────────────────────────
 capture_and_relay() {
     local pid="$1" ip="$2" port="$3"
@@ -128,18 +103,31 @@ capture_and_relay() {
     local exe;  exe=$(get_exe "$pid")
     local cwd;  cwd=$(get_cwd "$pid")
 
-    # Build JSON using python3 for correct escaping
+    # Write raw values to temp files so Python reads them safely (no shell escaping issues)
+    local tmpdir; tmpdir=$(mktemp -d)
+    printf '%s' "$cmdline" > "$tmpdir/cmdline.txt"
+    printf '%s' "$name"    > "$tmpdir/name.txt"
+    printf '%s' "$exe"     > "$tmpdir/exe.txt"
+    printf '%s' "$cwd"     > "$tmpdir/cwd.txt"
+    printf '%d' "$pid"     > "$tmpdir/pid.txt"
+
+    # Build JSON — reads everything from temp files, no argv string passing
     local json
-    json=$(python3 - "$pid" "$name" "$exe" "$cmdline" "$cwd" <<'PYEOF'
-import sys, json, subprocess, shlex
+    json=$(python3 <<PYEOF
+import json, subprocess, shlex, os
 
-pid     = int(sys.argv[1])
-name    = sys.argv[2]
-exe     = sys.argv[3]
-cmdline = shlex.split(sys.argv[4])
-cwd     = sys.argv[5]
+tmpdir  = "$tmpdir"
+pid     = int(open(tmpdir+"/pid.txt").read().strip())
+name    = open(tmpdir+"/name.txt").read()
+exe     = open(tmpdir+"/exe.txt").read()
+cwd     = open(tmpdir+"/cwd.txt").read()
+raw_cmd = open(tmpdir+"/cmdline.txt").read()
 
-# Try to grab env from ps eww (approximate on macOS)
+try:
+    cmdline = shlex.split(raw_cmd)
+except ValueError:
+    cmdline = raw_cmd.split()
+
 environ = {}
 try:
     out = subprocess.check_output(["ps", "eww", "-p", str(pid)], text=True, stderr=subprocess.DEVNULL)
@@ -152,33 +140,64 @@ try:
 except Exception:
     pass
 
-payload = {
-    "pid":     pid,
-    "name":    name,
-    "exe":     exe,
-    "cmdline": cmdline,
-    "cwd":     cwd,
-    "environ": environ,
-}
+payload = {"pid": pid, "name": name, "exe": exe, "cmdline": cmdline, "cwd": cwd, "environ": environ}
 print(json.dumps(payload))
 PYEOF
 )
 
-    log "── Payload: ${#json} bytes ──" "$SUBTLE"
+    rm -rf "$tmpdir"
+
+    local json_bytes=${#json}
+    log "── Payload: $json_bytes bytes ──" "$SUBTLE"
+
+    if [[ -z "$json" || "$json" == "null" ]]; then
+        log "✗  Failed to build JSON payload" "$RED" bold
+        return
+    fi
 
     local kill_result; kill_result=$(kill_process "$pid")
     log "Local process killed: $kill_result" "$YELLOW"
 
     log "Sending to $ip:$port …" "$CYAN"
-    local result; result=$(send_payload "$ip" "$port" "$json")
+
+    # Write JSON to temp file so Python send script reads it safely too
+    local jsontmp; jsontmp=$(mktemp)
+    printf '%s' "$json" > "$jsontmp"
+
+    local result
+    result=$(python3 <<PYEOF
+import socket, os, sys
+
+ip      = "$ip"
+port    = $port
+jsontmp = "$jsontmp"
+
+with open(jsontmp, "rb") as f:
+    data = f.read()
+
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(10)
+        s.connect((ip, port))
+        s.sendall(len(data).to_bytes(8, "big") + data)
+    print("ok")
+except ConnectionRefusedError:
+    print("fail:Connection refused — is the receiver running on {}:{}?".format(ip, port))
+except socket.timeout:
+    print("fail:Timeout connecting to {}:{}".format(ip, port))
+except OSError as e:
+    print("fail:{}".format(e))
+PYEOF
+)
+    rm -f "$jsontmp"
 
     if [[ "$result" == "ok" ]]; then
-        log "✓  Sent ${#json} bytes to $ip:$port" "$GREEN" bold
+        log "✓  Sent $json_bytes bytes to $ip:$port" "$GREEN" bold
         ((TRANSFERS++))
         log "Total transfers this session: $TRANSFERS" "$GREEN"
     else
-        log "✗  Send failed — $result" "$RED" bold
-        log "    Check: is the receiver running? Is the IP/port correct?" "$RED"
+        local errmsg="${result#fail:}"
+        log "✗  Send failed — $errmsg" "$RED" bold
     fi
 }
 
