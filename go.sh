@@ -1,247 +1,79 @@
 #!/bin/bash
 
-# LoL Game Relay — SENDER (macOS)
-# ====================================================
-# Pure Bash version for macOS.
-# Requires: jq (brew install jq)
+# --- CONFIGURATION ---
+RECEIVER_IP="192.168.1.XXX"  # <--- CHANGE THIS
+RECEIVER_PORT=54321
+POLL_INTERVAL=1
 
-# --- ANSI Colors ---
-RESET="\033[0m"
-BOLD="\033[1m"
-RED="\033[91m"
-GREEN="\033[92m"
-YELLOW="\033[93m"
-CYAN="\033[96m"
-GOLD="\033[33m"
-SUBTLE="\033[90m"
-WHITE="\033[97m"
+# --- COLORS ---
+G="\033[32m"; Y="\033[33m"; R="\033[31m"; C="\033[36m"; N="\033[0m"
 
-# --- Defaults ---
-DEFAULT_RECEIVER_IP="192.168.1.XXX"
-DEFAULT_RECEIVER_PORT=54321
-POLL_INTERVAL=1.0
+echo -e "${C}⚡ LoL Relay [macOS] Started${N}"
+echo -e "${Y}Target: $RECEIVER_IP:$RECEIVER_PORT${N}"
+echo -e "${Y}Watching for League of Legends...${N}"
 
-GAME_KEYWORDS="leagueoflegends league of legends"
-EXCLUDE_KEYWORDS="leagueclient leagueclientux riotclientservices riotclientux patcher crashhandler"
+SEEN_PIDS=""
 
-MIN_ARGS=5
-CMDLINE_WAIT_TIMEOUT=10
-CMDLINE_POLL=0.3
+while true; do
+    # Find PIDs of processes containing "League" (case-insensitive)
+    PIDS=$(ps ax | grep -i "League" | grep -v "grep" | awk '{print $1}')
 
-# --- Globals ---
-_WATCHING=false
-_SEEN_PIDS=""
-_TRANSFERS=0
+    for PID in $PIDS; do
+        # Skip if we already handled this PID
+        if [[ ! " $SEEN_PIDS " =~ " $PID " ]]; then
+            
+            # Get command line arguments
+            CMDLINE=$(ps -p $PID -o command= 2>/dev/null)
+            
+            # Check if it's the actual game (not the client)
+            # Game usually has many arguments, Client has few.
+            ARG_COUNT=$(echo "$CMDLINE" | wc -w)
+            
+            if [[ "$CMDLINE" == *"League of Legends"* ]] && [ "$ARG_COUNT" -gt 10 ]; then
+                echo -e "${G}Found Game Process: $PID${N}"
+                SEEN_PIDS="$SEEN_PIDS $PID"
 
-# --- Logging ---
-log() {
-    local msg="$1"
-    local color="$2"
-    local bold="$3"
-    local ts=$(date +"%H:%M:%S")
-    local style=""
-    [ "$bold" = "true" ] && style="$BOLD"
-    echo -e "${SUBTLE}[${ts}]${RESET}  ${style}${color}${msg}${RESET}"
+                # 1. Collect Info
+                NAME=$(ps -p $PID -o comm=)
+                EXE=$(echo "$CMDLINE" | awk '{print $1}')
+                CWD=$(lsof -a -p $PID -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+                
+                # 2. Build JSON using Python (built-in on macOS) to avoid 'jq' dependency
+                JSON_DATA=$(python3 -c "
+import json, sys, time
+data = {
+    'pid': $PID,
+    'name': '$NAME',
+    'exe': '$EXE',
+    'cmdline': sys.argv[1].split(' '),
+    'cwd': '$CWD',
+    'environ': {},
+    'created': int(time.time())
 }
+print(json.dumps(data))
+" "$CMDLINE")
 
-banner() {
-    echo -e "\n${GOLD}${BOLD}========================================================${RESET}"
-    echo -e "${GOLD}${BOLD}  ⚡  LoL RELAY  ·  SENDER  [macOS]  —  TERMINAL${RESET}"
-    echo -e "${GOLD}${BOLD}========================================================${RESET}"
-    echo -e "${SUBTLE}  Host: $(hostname)${RESET}\n"
-}
+                # 3. Kill Process
+                kill -9 $PID 2>/dev/null
+                echo -e "${R}Killed local process $PID${N}"
 
-# --- Process helpers ---
-is_game_process() {
-    local pid="$1"
-    local name=$(ps -p "$pid" -o comm= 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    local cmdline=$(ps -p "$pid" -o command= 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    local identity="$name $cmdline"
-
-    local is_game=false
-    for k in $GAME_KEYWORDS; do
-        if [[ "$identity" == *"$k"* ]]; then
-            is_game=true
-            break
-        fi
-    done
-
-    [ "$is_game" = "false" ] && return 1
-
-    for k in $EXCLUDE_KEYWORDS; do
-        if [[ "$identity" == *"$k"* ]]; then
-            return 1
-        fi
-    done
-
-    return 0
-}
-
-wait_for_full_cmdline() {
-    local pid="$1"
-    local start=$(date +%s)
-    local deadline=$((start + CMDLINE_WAIT_TIMEOUT))
-
-    while [ $(date +%s) -lt $deadline ]; do
-        local current_cmdline=$(ps -p "$pid" -o command= 2>/dev/null)
-        [ -z "$current_cmdline" ] && break
-        
-        local num_args=$(echo "$current_cmdline" | wc -w)
-        if [ "$num_args" -ge $MIN_ARGS ]; then
-            local elapsed=$(($(date +%s) - start))
-            echo "$current_cmdline|$elapsed"
-            return 0
-        fi
-        log "  Waiting for args … (${num_args} so far)" "$SUBTLE"
-        sleep "$CMDLINE_POLL"
-    done
-    echo "|$CMDLINE_WAIT_TIMEOUT"
-    return 1
-}
-
-collect_info() {
-    local pid="$1"
-    local full_cmdline="$2"
-    
-    local name=$(ps -p "$pid" -o comm= 2>/dev/null)
-    local exe=$(ps -p "$pid" -o command= 2>/dev/null | awk '{print $1}')
-    local cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
-    
-    # Simple env capture
-    local environ_json="{}"
-    local ps_env=$(ps eww -p "$pid" 2>/dev/null | tail -n 1 | sed -E "s/^[[:space:]]*[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+//")
-    
-    # Build JSON using jq
-    jq -n \
-        --arg pid "$pid" \
-        --arg name "$name" \
-        --arg exe "$exe" \
-        --arg cmd_str "$full_cmdline" \
-        --arg cwd "$cwd" \
-        '
-        {
-            pid: ($pid | tonumber),
-            name: $name,
-            exe: $exe,
-            cmdline: ($cmd_str | split(" ")),
-            cwd: $cwd,
-            environ: {},
-            created: (now | floor)
-        }
-        '
-}
-
-kill_process() {
-    local pid="$1"
-    kill -TERM "$pid" 2>/dev/null
-    sleep 1
-    if ps -p "$pid" >/dev/null 2>&1; then
-        kill -KILL "$pid" 2>/dev/null
-        echo "SIGKILL — forced"
-    else
-        echo "SIGTERM — graceful"
-    fi
-}
-
-send_info() {
-    local payload="$1"
-    local ip="$2"
-    local port="$3"
-
-    local len=$(echo -n "$payload" | wc -c | tr -d ' ')
-    # Python's to_bytes(8, 'big') equivalent in bash/printf
-    # We need to send 8 bytes of length then the payload
-    # This is a bit tricky in pure bash, using python for the header if available
-    # or just sending raw if the receiver can handle it.
-    # To be safe and "smart", we'll use a tiny python one-liner for the header.
-    
-    (python3 -c "import sys; sys.stdout.buffer.write($len.to_bytes(8, 'big'))" 2>/dev/null || \
-     printf "\x00\x00\x00\x00\x00\x00\x00%b" $(printf "\\x%02x" $len)) && echo -n "$payload" | nc -w 5 "$ip" "$port"
-}
-
-capture_and_relay() {
-    local pid="$1"
-    local ip="$2"
-    local port="$3"
-
-    log "Game process found: PID=$pid" "$GREEN" true
-    
-    local res=$(wait_for_full_cmdline "$pid")
-    local cmdline="${res%|*}"
-    local elapsed="${res#*|}"
-
-    if [ -z "$cmdline" ]; then
-        log "⚠ Timeout/Exit before args ready." "$RED"
-        return
-    fi
-
-    log "Args captured in ${elapsed}s" "$GREEN"
-    local info=$(collect_info "$pid" "$cmdline")
-    
-    log "── Launch Arguments ──" "$GOLD" true
-    echo "$cmdline" | tr ' ' '\n' | nl -w2 -s'  ' | while read -r line; do
-        log "  $line" "$WHITE"
-    done
-
-    kill_result=$(kill_process "$pid")
-    log "Local process killed: $kill_result" "$YELLOW"
-
-    log "Sending to $ip:$port …" "$CYAN"
-    if send_info "$info" "$ip" "$port"; then
-        log "✓ Sent successfully" "$GREEN" true
-        _TRANSFERS=$((_TRANSFERS + 1))
-    else
-        log "✗ Send failed" "$RED" true
-    fi
-}
-
-watch_loop() {
-    local ip="$1"
-    local port="$2"
-    log "Watcher started..." "$YELLOW" true
-    
-    while $_WATCHING; do
-        # Use pgrep if available, else ps
-        local pids=$(pgrep -i "league" 2>/dev/null || ps ax | grep -i "league" | grep -v grep | awk '{print $1}')
-        
-        for pid in $pids; do
-            [[ " $_SEEN_PIDS " == *" $pid "* ]] && continue
-            if is_game_process "$pid"; then
-                _SEEN_PIDS="$_SEEN_PIDS $pid"
-                capture_and_relay "$pid" "$ip" "$port"
+                # 4. Send over TCP using Python to ensure correct 8-byte header
+                echo -e "${C}Sending to receiver...${N}"
+                python3 -c "
+import socket, sys
+payload = sys.stdin.read().encode('utf-8')
+header = len(payload).to_bytes(8, 'big')
+try:
+    with socket.create_connection(('$RECEIVER_IP', $RECEIVER_PORT), timeout=5) as s:
+        s.sendall(header + payload)
+    print('DONE')
+except Exception as e:
+    print(f'ERROR: {e}')
+" <<< "$JSON_DATA"
+                
+                echo -e "${G}Transfer Complete!${N}"
             fi
-        done
-        sleep "$POLL_INTERVAL"
+        fi
     done
-}
-
-main() {
-    banner
-    read -p "Receiver IP [$DEFAULT_RECEIVER_IP]: " ip
-    ip=${ip:-$DEFAULT_RECEIVER_IP}
-    read -p "Receiver Port [$DEFAULT_RECEIVER_PORT]: " port
-    port=${port:-$DEFAULT_RECEIVER_PORT}
-
-    echo -e "\n${GREEN}s${RESET} = Start, ${RED}q${RESET} = Quit"
-    
-    while true; do
-        read -p "> " cmd
-        case "$cmd" in
-            s)
-                if $_WATCHING; then log "Running..." "$YELLOW"; else
-                    _WATCHING=true
-                    watch_loop "$ip" "$port" &
-                fi ;;
-            q) exit 0 ;;
-            *) log "Unknown command" "$SUBTLE" ;;
-        esac
-    done
-}
-
-# Dependency check
-if ! command -v jq >/dev/null 2>&1; then
-    echo "Error: 'jq' is required. Install with: brew install jq"
-    exit 1
-fi
-
-main
+    sleep $POLL_INTERVAL
+done
