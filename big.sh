@@ -1,293 +1,466 @@
-#!/usr/bin/env bash
-# LoL Game Relay — SENDER (macOS) — NO EXTRA DEPENDENCIES
-# Uses only tools built into macOS: bash, ps, lsof, awk, python3 (pre-installed)
+#!/usr/bin/env node
+/**
+ * LoL Game Relay — SENDER (macOS) — NODE.JS VERSION
+ * ===================================================
+ * • Watches for the League of Legends GAME process
+ * • Captures all launch args + env vars
+ * • Auto-detects active LAN IPs on the network and sends to all / chosen one
+ * • Kills the local game process after capture
+ * • Fully terminal-based with colored output
+ *
+ * Dependencies: ps-list  (auto-installed by the .sh launcher)
+ */
 
-DEFAULT_RECEIVER_IP="192.168.1.XXX"
-DEFAULT_RECEIVER_PORT="54321"
-POLL_INTERVAL=1
-CMDLINE_WAIT_TIMEOUT=10
-MIN_ARGS=5
+"use strict";
 
-RESET="\033[0m"; BOLD="\033[1m"; RED="\033[91m"; GREEN="\033[92m"
-YELLOW="\033[93m"; CYAN="\033[96m"; GOLD="\033[33m"; SUBTLE="\033[90m"; WHITE="\033[97m"
+const net        = require("net");
+const os         = require("os");
+const { execSync, exec } = require("child_process");
+const readline   = require("readline");
 
-WATCHING=0
-TRANSFERS=0
-declare -A SEEN_PIDS
-
-log() {
-    local ts; ts=$(date +%H:%M:%S)
-    local style="${3:+$BOLD}${2:-}"
-    printf "${SUBTLE}[%s]${RESET}  ${style}%s${RESET}\n" "$ts" "$1"
+// ── Lazy-load ps-list (ESM) ──────────────────────────────────────────────────
+let psListFn = null;
+async function psList() {
+  if (!psListFn) {
+    const mod = await import("ps-list");
+    psListFn  = mod.default;
+  }
+  return psListFn();
 }
 
-banner() {
-    echo
-    printf "${GOLD}${BOLD}%s${RESET}\n" "========================================================"
-    printf "${GOLD}${BOLD}  ⚡  LoL RELAY  ·  SENDER  [macOS]${RESET}\n"
-    printf "${GOLD}${BOLD}%s${RESET}\n" "========================================================"
-    printf "${SUBTLE}  Host: %s${RESET}\n" "$(hostname)"
-    echo
+// ── ANSI Colors ───────────────────────────────────────────────────────────────
+const R  = "\x1b[0m";
+const B  = "\x1b[1m";
+const RED    = "\x1b[91m";
+const GREEN  = "\x1b[92m";
+const YELLOW = "\x1b[93m";
+const CYAN   = "\x1b[96m";
+const GOLD   = "\x1b[33m";
+const SUBTLE = "\x1b[90m";
+const WHITE  = "\x1b[97m";
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const DEFAULT_PORT       = 54321;
+const POLL_INTERVAL_MS   = 1000;
+const CMDLINE_WAIT_MS    = 10_000;
+const CMDLINE_POLL_MS    = 300;
+const MIN_ARGS           = 5;
+
+const GAME_KEYWORDS    = ["leagueoflegends", "league of legends", "league_of_legends"];
+const EXCLUDE_KEYWORDS = ["leagueclient", "leagueclientux", "riotclientservices",
+                          "riotclientux", "patcher", "crashhandler"];
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let watching   = false;
+let seenPids   = new Set();
+let transfers  = 0;
+let watchTimer = null;
+
+// ── Logging ───────────────────────────────────────────────────────────────────
+function ts() { return new Date().toTimeString().slice(0,8); }
+
+function log(msg, color = "", bold = false) {
+  const style = (bold ? B : "") + color;
+  process.stdout.write(`${SUBTLE}[${ts()}]${R}  ${style}${msg}${R}\n`);
 }
 
-find_game_pids() {
-    ps aux 2>/dev/null | awk '
-        tolower($0) ~ /leagueoflegends/ &&
-        tolower($0) !~ /leagueclient/ &&
-        tolower($0) !~ /leagueclientux/ &&
-        tolower($0) !~ /riotclientservices/ &&
-        tolower($0) !~ /riotclientux/ &&
-        tolower($0) !~ /patcher/ &&
-        tolower($0) !~ /crashhandler/ &&
-        $0 !~ /awk/ &&
-        $0 !~ /lol_sender/ {print $2}'
+function banner() {
+  console.log();
+  console.log(`${GOLD}${B}${"=".repeat(56)}${R}`);
+  console.log(`${GOLD}${B}  ⚡  LoL RELAY  ·  SENDER  [macOS]  —  NODE.JS${R}`);
+  console.log(`${GOLD}${B}${"=".repeat(56)}${R}`);
+  console.log(`${SUBTLE}  Host: ${os.hostname()}${R}`);
+  console.log();
 }
 
-get_cmdline() { ps -p "$1" -o command= 2>/dev/null; }
-get_exe()     { ps -p "$1" -o comm=    2>/dev/null; }
-get_cwd()     { lsof -p "$1" -a -d cwd -Fn 2>/dev/null | awk '/^n/{sub(/^n/,""); print; exit}'; }
-count_args()  { echo "$1" | awk '{print NF}'; }
+// ── Network helpers ───────────────────────────────────────────────────────────
 
-wait_for_full_cmdline() {
-    local pid="$1"
-    local deadline=$((SECONDS + CMDLINE_WAIT_TIMEOUT))
-    while [[ $SECONDS -lt $deadline ]]; do
-        local cmdline; cmdline=$(get_cmdline "$pid")
-        local n; n=$(count_args "$cmdline")
-        if [[ $n -ge $MIN_ARGS ]]; then echo "$cmdline"; return 0; fi
-        log "  Waiting for args … ($n so far)" "$SUBTLE"
-        sleep 0.3
-    done
-    return 1
+/**
+ * Returns all non-loopback IPv4 addresses on this machine.
+ */
+function getLocalIPs() {
+  const ifaces = os.networkInterfaces();
+  const ips = [];
+  for (const name of Object.keys(ifaces)) {
+    for (const iface of ifaces[name]) {
+      if (iface.family === "IPv4" && !iface.internal) {
+        ips.push({ name, address: iface.address, netmask: iface.netmask });
+      }
+    }
+  }
+  return ips;
 }
 
-kill_process() {
-    local pid="$1"
-    kill -0 "$pid" 2>/dev/null || { echo "already gone"; return; }
-    kill -TERM "$pid" 2>/dev/null
-    for _ in $(seq 1 10); do
-        sleep 0.5
-        kill -0 "$pid" 2>/dev/null || { echo "SIGTERM — graceful"; return; }
-    done
-    kill -KILL "$pid" 2>/dev/null && { echo "SIGKILL — forced"; return; }
-    sudo kill -9 "$pid" 2>/dev/null && { echo "killed via sudo"; return; }
-    echo "ACCESS DENIED — try: sudo bash lol_sender.sh"
+/**
+ * Ping-scan the /24 subnet of `localIP` and return hosts that respond.
+ * Uses fping if available, otherwise falls back to sequential ping.
+ * Returns an array of IP strings.
+ */
+async function scanSubnet(localIP) {
+  const base = localIP.split(".").slice(0, 3).join(".");
+  log(`Scanning ${base}.0/24 for live hosts …`, CYAN);
+
+  // Try fping first (fast)
+  try {
+    execSync("which fping", { stdio: "ignore" });
+    const result = execSync(
+      `fping -a -g ${base}.1 ${base}.254 2>/dev/null`,
+      { timeout: 8000, encoding: "utf8" }
+    );
+    return result.trim().split("\n").filter(Boolean).filter(ip => ip !== localIP);
+  } catch (_) {/* fping not available or failed */}
+
+  // Fallback: parallel ping sweep
+  const promises = [];
+  for (let i = 1; i <= 254; i++) {
+    const ip = `${base}.${i}`;
+    if (ip === localIP) continue;
+    promises.push(new Promise(resolve => {
+      exec(`ping -c 1 -W 1 ${ip}`, (err) => resolve(err ? null : ip));
+    }));
+  }
+  const results = await Promise.all(promises);
+  return results.filter(Boolean);
 }
 
-# ── Collect process info and build JSON ───────────────────────────────────────
-capture_and_relay() {
-    local pid="$1" ip="$2" port="$3"
-    local name; name=$(get_exe "$pid")
-
-    log "Game process found:  PID=$pid  Name=$name" "$GREEN" bold
-    log "Waiting for full args (max ${CMDLINE_WAIT_TIMEOUT}s) …" "$YELLOW"
-
-    local cmdline
-    if ! cmdline=$(wait_for_full_cmdline "$pid"); then
-        log "⚠  Timeout — process may have exited or args are restricted." "$RED"
-        return
-    fi
-
-    local n; n=$(count_args "$cmdline")
-    log "Args ready: $n tokens" "$GREEN"
-
-    log "── Launch Arguments ──" "$GOLD" bold
-    local i=0
-    while IFS= read -r arg; do
-        [[ -z "$arg" ]] && continue
-        local c="$WHITE"; [[ $i -eq 0 ]] && c="$GOLD"
-        log "  [$i]  $arg" "$c"
-        ((i++))
-    done < <(echo "$cmdline" | tr ' ' '\n')
-
-    local exe;  exe=$(get_exe "$pid")
-    local cwd;  cwd=$(get_cwd "$pid")
-
-    # Write raw values to temp files so Python reads them safely (no shell escaping issues)
-    local tmpdir; tmpdir=$(mktemp -d)
-    printf '%s' "$cmdline" > "$tmpdir/cmdline.txt"
-    printf '%s' "$name"    > "$tmpdir/name.txt"
-    printf '%s' "$exe"     > "$tmpdir/exe.txt"
-    printf '%s' "$cwd"     > "$tmpdir/cwd.txt"
-    printf '%d' "$pid"     > "$tmpdir/pid.txt"
-
-    # Build JSON — reads everything from temp files, no argv string passing
-    local json
-    json=$(python3 <<PYEOF
-import json, subprocess, shlex, os
-
-tmpdir  = "$tmpdir"
-pid     = int(open(tmpdir+"/pid.txt").read().strip())
-name    = open(tmpdir+"/name.txt").read()
-exe     = open(tmpdir+"/exe.txt").read()
-cwd     = open(tmpdir+"/cwd.txt").read()
-raw_cmd = open(tmpdir+"/cmdline.txt").read()
-
-try:
-    cmdline = shlex.split(raw_cmd)
-except ValueError:
-    cmdline = raw_cmd.split()
-
-environ = {}
-try:
-    out = subprocess.check_output(["ps", "eww", "-p", str(pid)], text=True, stderr=subprocess.DEVNULL)
-    for line in out.splitlines()[1:]:
-        for token in line.split():
-            if '=' in token:
-                k, _, v = token.partition('=')
-                if k.replace('_','').isalnum():
-                    environ[k] = v
-except Exception:
-    pass
-
-payload = {"pid": pid, "name": name, "exe": exe, "cmdline": cmdline, "cwd": cwd, "environ": environ}
-print(json.dumps(payload))
-PYEOF
-)
-
-    rm -rf "$tmpdir"
-
-    local json_bytes=${#json}
-    log "── Payload: $json_bytes bytes ──" "$SUBTLE"
-
-    if [[ -z "$json" || "$json" == "null" ]]; then
-        log "✗  Failed to build JSON payload" "$RED" bold
-        return
-    fi
-
-    local kill_result; kill_result=$(kill_process "$pid")
-    log "Local process killed: $kill_result" "$YELLOW"
-
-    log "Sending to $ip:$port …" "$CYAN"
-
-    # Write JSON to temp file so Python send script reads it safely too
-    local jsontmp; jsontmp=$(mktemp)
-    printf '%s' "$json" > "$jsontmp"
-
-    local result
-    result=$(python3 <<PYEOF
-import socket, os, sys
-
-ip      = "$ip"
-port    = $port
-jsontmp = "$jsontmp"
-
-with open(jsontmp, "rb") as f:
-    data = f.read()
-
-try:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(10)
-        s.connect((ip, port))
-        s.sendall(len(data).to_bytes(8, "big") + data)
-    print("ok")
-except ConnectionRefusedError:
-    print("fail:Connection refused — is the receiver running on {}:{}?".format(ip, port))
-except socket.timeout:
-    print("fail:Timeout connecting to {}:{}".format(ip, port))
-except OSError as e:
-    print("fail:{}".format(e))
-PYEOF
-)
-    rm -f "$jsontmp"
-
-    if [[ "$result" == "ok" ]]; then
-        log "✓  Sent $json_bytes bytes to $ip:$port" "$GREEN" bold
-        ((TRANSFERS++))
-        log "Total transfers this session: $TRANSFERS" "$GREEN"
-    else
-        local errmsg="${result#fail:}"
-        log "✗  Send failed — $errmsg" "$RED" bold
-    fi
+/**
+ * Try TCP-connecting to `ip:port` to see if a receiver is listening.
+ */
+function probePort(ip, port) {
+  return new Promise(resolve => {
+    const s = new net.Socket();
+    s.setTimeout(1500);
+    s.once("connect",  () => { s.destroy(); resolve(true);  });
+    s.once("error",    () => { s.destroy(); resolve(false); });
+    s.once("timeout",  () => { s.destroy(); resolve(false); });
+    s.connect(port, ip);
+  });
 }
 
-# ── Watch loop ────────────────────────────────────────────────────────────────
-watch_loop() {
-    local ip="$1" port="$2"
-    log "Watcher started — waiting for game …" "$YELLOW" bold
+/**
+ * Auto-detect receiver: scan LAN and find hosts with the relay port open.
+ * Returns array of IPs with the port open.
+ */
+async function autoDetectReceivers(port) {
+  const localIPs = getLocalIPs();
+  if (localIPs.length === 0) {
+    log("No active network interfaces found.", RED);
+    return [];
+  }
 
-    while [[ $WATCHING -eq 1 ]]; do
-        local pids; pids=$(find_game_pids)
-        if [[ -n "$pids" ]]; then
-            while IFS= read -r pid; do
-                [[ -z "$pid" ]] && continue
-                if [[ -z "${SEEN_PIDS[$pid]:-}" ]]; then
-                    SEEN_PIDS[$pid]=1
-                    capture_and_relay "$pid" "$ip" "$port" &
-                fi
-            done <<< "$pids"
-        fi
-        sleep "$POLL_INTERVAL"
-    done
-    log "Watcher stopped." "$SUBTLE"
+  log(`Local interfaces: ${localIPs.map(i => `${i.name}(${i.address})`).join(", ")}`, SUBTLE);
+
+  // Collect all live hosts across all subnets
+  let liveHosts = [];
+  for (const iface of localIPs) {
+    const hosts = await scanSubnet(iface.address);
+    liveHosts.push(...hosts);
+  }
+
+  // Deduplicate
+  liveHosts = [...new Set(liveHosts)];
+  log(`Found ${liveHosts.length} live host(s) — probing port ${port} …`, CYAN);
+
+  // Probe port in parallel
+  const probeResults = await Promise.all(
+    liveHosts.map(async ip => ({ ip, open: await probePort(ip, port) }))
+  );
+
+  const receivers = probeResults.filter(r => r.open).map(r => r.ip);
+  return receivers;
 }
 
-cleanup() {
-    WATCHING=0; echo
-    log "Interrupted — exiting." "$YELLOW"
-    kill 0 2>/dev/null; exit 0
+// ── Send payload ──────────────────────────────────────────────────────────────
+
+function sendPayload(info, ip, port) {
+  return new Promise(resolve => {
+    const payload = Buffer.from(JSON.stringify(info), "utf8");
+    const header  = Buffer.alloc(8);
+    header.writeBigUInt64BE(BigInt(payload.length));
+
+    const s = new net.Socket();
+    s.setTimeout(10_000);
+
+    s.connect(port, ip, () => {
+      s.write(Buffer.concat([header, payload]), () => {
+        s.end();
+        resolve({ ok: true, msg: `✓  Sent ${payload.length.toLocaleString()} bytes to ${ip}:${port}` });
+      });
+    });
+
+    s.on("error", err => {
+      s.destroy();
+      if (err.code === "ECONNREFUSED")
+        resolve({ ok: false, msg: `✗  Connection refused — is the receiver running on ${ip}:${port}?` });
+      else
+        resolve({ ok: false, msg: `✗  Network error: ${err.message}` });
+    });
+
+    s.on("timeout", () => {
+      s.destroy();
+      resolve({ ok: false, msg: `✗  Timeout connecting to ${ip}:${port}` });
+    });
+  });
 }
-trap cleanup SIGINT SIGTERM
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-banner
+// ── Process helpers ───────────────────────────────────────────────────────────
 
-printf "${GOLD}── Configuration ──────────────────────────────${RESET}\n"
-printf "${CYAN}Receiver IP  (Windows PC LAN IP)${RESET} [${SUBTLE}%s${RESET}]: " "$DEFAULT_RECEIVER_IP"
-read -r input_ip;   RECEIVER_IP="${input_ip:-$DEFAULT_RECEIVER_IP}"
+function isGameProcess(proc) {
+  const identity = `${(proc.name || "").toLowerCase()} ${(proc.cmd || "").toLowerCase()}`;
+  if (!GAME_KEYWORDS.some(k => identity.includes(k))) return false;
+  if (EXCLUDE_KEYWORDS.some(k => identity.includes(k))) return false;
+  return true;
+}
 
-printf "${CYAN}Receiver Port${RESET} [${SUBTLE}%s${RESET}]: " "$DEFAULT_RECEIVER_PORT"
-read -r input_port; RECEIVER_PORT="${input_port:-$DEFAULT_RECEIVER_PORT}"
+/**
+ * Get full cmdline for a PID via `ps`.
+ * ps-list often gives a truncated cmd; we use ps -p PID -o args= for the full one.
+ */
+function getFullCmdline(pid) {
+  try {
+    const raw = execSync(`ps -p ${pid} -o args=`, { encoding: "utf8", timeout: 3000 }).trim();
+    if (!raw) return [];
+    return raw.split(/\s+/);
+  } catch (_) {
+    return [];
+  }
+}
 
-echo
-log "Target:  $RECEIVER_IP:$RECEIVER_PORT" "$CYAN" bold
-log "Host:    $(hostname)" "$CYAN"
-echo
+/**
+ * Poll until cmdline has >= MIN_ARGS tokens or timeout.
+ */
+async function waitForFullCmdline(pid) {
+  const deadline = Date.now() + CMDLINE_WAIT_MS;
+  const start    = Date.now();
+  while (Date.now() < deadline) {
+    const args = getFullCmdline(pid);
+    if (args.length >= MIN_ARGS) {
+      return { args, elapsed: ((Date.now() - start) / 1000).toFixed(2) };
+    }
+    log(`  Waiting for args … (${args.length} so far)`, SUBTLE);
+    await sleep(CMDLINE_POLL_MS);
+  }
+  return { args: [], elapsed: (CMDLINE_WAIT_MS / 1000).toFixed(2) };
+}
 
-printf "${GOLD}── Commands ────────────────────────────────────${RESET}\n"
-printf "  ${GREEN}s${RESET}      → Start watching\n"
-printf "  ${CYAN}status${RESET} → Show status\n"
-printf "  ${RED}q${RESET}      → Quit\n"
-printf "  ${SUBTLE}Press Ctrl+C at any time to exit${RESET}\n"
-echo
+/**
+ * Collect process info (exe path, cwd, env) via proc filesystem / lsof.
+ */
+function collectInfo(pid, name, cmdline) {
+  const info = { pid, name, cmdline, exe: "", cwd: "", environ: {}, created: Date.now() / 1000 };
 
-WATCH_PID=""
+  // exe
+  try { info.exe = execSync(`lsof -p ${pid} -Fn | grep '^n' | head -1`, { encoding: "utf8" }).trim().slice(1); } catch (_) {}
+  try { info.exe = execSync(`ps -p ${pid} -o comm=`, { encoding: "utf8" }).trim(); } catch (_) {}
 
-while true; do
-    printf "${GOLD}>${RESET} "
-    read -r cmd
-    case "$cmd" in
-        s|start)
-            if [[ $WATCHING -eq 1 ]]; then
-                log "Already watching!" "$YELLOW"
-            else
-                WATCHING=1
-                declare -A SEEN_PIDS=()
-                watch_loop "$RECEIVER_IP" "$RECEIVER_PORT" &
-                WATCH_PID=$!
-            fi ;;
-        stop)
-            if [[ $WATCHING -eq 1 ]]; then
-                WATCHING=0
-                [[ -n "$WATCH_PID" ]] && kill "$WATCH_PID" 2>/dev/null
-                WATCH_PID=""
-            else
-                log "Not watching." "$SUBTLE"
-            fi ;;
-        status)
-            local_state="${RED}${BOLD}IDLE${RESET}"
-            [[ $WATCHING -eq 1 ]] && local_state="${GREEN}${BOLD}WATCHING${RESET}"
-            printf "${SUBTLE}[$(date +%H:%M:%S)]${RESET}  Status: ${local_state}  |  Transfers: ${TRANSFERS}\n" ;;
-        help)
-            printf "  ${GREEN}s${RESET}      — start watching\n"
-            printf "  ${RED}stop${RESET}   — stop watching\n"
-            printf "  ${CYAN}status${RESET} — show current status\n"
-            printf "  ${RED}q${RESET}      — quit\n" ;;
-        q|quit|exit)
-            WATCHING=0
-            [[ -n "$WATCH_PID" ]] && kill "$WATCH_PID" 2>/dev/null
-            log "Goodbye." "$SUBTLE"; break ;;
-        "") ;;
-        *) log "Unknown command '$cmd'. Type 'help'." "$SUBTLE" ;;
-    esac
-done
+  // cwd
+  try { info.cwd = execSync(`lsof -p ${pid} -a -d cwd -Fn | grep '^n'`, { encoding: "utf8" }).trim().slice(1); } catch (_) {}
+
+  // environ from /proc (Linux) or `ps eww` (macOS)
+  try {
+    const envRaw = execSync(`ps eww -p ${pid} -o command=`, { encoding: "utf8", timeout: 3000 });
+    // ps eww appends env vars after the command, separated by spaces in KEY=VAL format
+    const envPart = envRaw.slice(envRaw.indexOf(" ") + 1);
+    const pairs   = envPart.match(/\b([A-Z_][A-Z0-9_]*)=([^\s]*)/g) || [];
+    for (const pair of pairs) {
+      const eq = pair.indexOf("=");
+      info.environ[pair.slice(0, eq)] = pair.slice(eq + 1);
+    }
+  } catch (_) {}
+
+  return info;
+}
+
+function killProcess(pid) {
+  try {
+    process.kill(pid, "SIGTERM");
+    return "SIGTERM — graceful";
+  } catch (e) {
+    if (e.code === "EPERM") {
+      try {
+        execSync(`sudo kill -9 ${pid}`, { timeout: 5000 });
+        return `killed via sudo kill -9 (PID ${pid})`;
+      } catch (e2) {
+        return `ACCESS DENIED + sudo failed: ${e2.message}  → run with sudo`;
+      }
+    }
+    return `already gone (${e.code})`;
+  }
+}
+
+// ── Capture & relay ───────────────────────────────────────────────────────────
+
+async function captureAndRelay(proc, receivers, port) {
+  const { pid, name } = proc;
+  log(`Game process found:  PID=${pid}  Name=${name}`, GREEN, true);
+  log(`Waiting for process to fully load args (max ${CMDLINE_WAIT_MS / 1000}s) …`, YELLOW);
+
+  const { args, elapsed } = await waitForFullCmdline(pid);
+
+  if (!args.length) {
+    log(`⚠  Timeout waiting for args — process may have exited early.`, RED);
+    return;
+  }
+
+  log(`Args ready:  ${args.length} tokens captured in ${elapsed}s`, GREEN);
+
+  const info = collectInfo(pid, name, args);
+
+  log("── Launch Arguments ──", GOLD, true);
+  args.forEach((arg, i) => {
+    log(`  [${String(i).padStart(2, "0")}]  ${arg}`, i === 0 ? GOLD : WHITE);
+  });
+  log(`── Environment: ${Object.keys(info.environ).length} vars captured ──`, SUBTLE);
+
+  // Kill local process
+  const killResult = killProcess(pid);
+  log(`Local process killed: ${killResult}`, YELLOW);
+
+  // Send to all detected receivers
+  for (const ip of receivers) {
+    log(`Sending to ${ip}:${port} …`, CYAN);
+    const { ok, msg } = await sendPayload(info, ip, port);
+    log(msg, ok ? GREEN : RED, true);
+    if (ok) {
+      transfers++;
+      log(`Total transfers this session: ${transfers}`, GREEN);
+    }
+  }
+}
+
+// ── Watch loop ────────────────────────────────────────────────────────────────
+
+async function watchLoop(receivers, port) {
+  if (!watching) return;
+  log("Watcher tick …", SUBTLE);
+
+  try {
+    const procs = await psList();
+    for (const proc of procs) {
+      if (!watching) break;
+      if (seenPids.has(proc.pid)) continue;
+      if (isGameProcess(proc)) {
+        seenPids.add(proc.pid);
+        captureAndRelay(proc, receivers, port).catch(e => log(`Error: ${e.message}`, RED));
+      }
+    }
+  } catch (e) {
+    log(`Watch error: ${e.message}`, RED);
+  }
+
+  if (watching) {
+    watchTimer = setTimeout(() => watchLoop(receivers, port), POLL_INTERVAL_MS);
+  }
+}
+
+function startWatching(receivers, port) {
+  if (watching) { log("Already watching!", YELLOW); return; }
+  watching  = true;
+  seenPids  = new Set();
+  log("Watcher started — waiting for game …", YELLOW, true);
+  watchLoop(receivers, port);
+}
+
+function stopWatching() {
+  watching = false;
+  if (watchTimer) { clearTimeout(watchTimer); watchTimer = null; }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function ask(rl, prompt, def) {
+  return new Promise(resolve => {
+    rl.question(`${CYAN}${prompt}${R} [${SUBTLE}${def}${R}]: `, ans => {
+      resolve(ans.trim() || def);
+    });
+  });
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+async function main() {
+  banner();
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  // Port config
+  console.log(`${GOLD}── Configuration ──────────────────────────────${R}`);
+  const portStr = await ask(rl, "Receiver Port", String(DEFAULT_PORT));
+  const port    = parseInt(portStr, 10) || DEFAULT_PORT;
+  console.log();
+
+  // Auto-detect receivers
+  log("Auto-detecting receiver(s) on LAN …", CYAN, true);
+  let receivers = await autoDetectReceivers(port);
+
+  if (receivers.length === 0) {
+    log("No receivers auto-detected. Enter IP manually.", YELLOW);
+    const manualIP = await ask(rl, "Receiver IP", "192.168.1.XXX");
+    receivers = [manualIP];
+  } else {
+    log(`Auto-detected ${receivers.length} receiver(s): ${receivers.join(", ")}`, GREEN, true);
+    const confirm = await ask(rl, `Use these? (y/n)`, "y");
+    if (confirm.toLowerCase() !== "y") {
+      const manualIP = await ask(rl, "Receiver IP", receivers[0]);
+      receivers = [manualIP];
+    }
+  }
+
+  console.log();
+  log(`Target(s): ${receivers.join(", ")}  Port: ${port}`, CYAN, true);
+  log(`Host:      ${os.hostname()}`, CYAN);
+  console.log();
+
+  // Command loop
+  console.log(`${GOLD}── Commands ────────────────────────────────────${R}`);
+  console.log(`  ${GREEN}s${R}      → Start watching`);
+  console.log(`  ${RED}stop${R}   → Stop watching`);
+  console.log(`  ${CYAN}status${R} → Show status`);
+  console.log(`  ${RED}q${R}      → Quit`);
+  console.log(`  ${SUBTLE}Press Ctrl+C at any time to exit${R}`);
+  console.log();
+
+  process.on("SIGINT", () => {
+    console.log();
+    log("Interrupt received — stopping …", YELLOW);
+    stopWatching();
+    rl.close();
+    process.exit(0);
+  });
+
+  const prompt = () => {
+    rl.question(`${GOLD}>${R} `, async cmd => {
+      cmd = cmd.trim().toLowerCase();
+
+      if (cmd === "s") {
+        startWatching(receivers, port);
+      } else if (cmd === "stop") {
+        if (watching) { stopWatching(); log("Watcher stopped.", SUBTLE); }
+        else           { log("Not watching.", SUBTLE); }
+      } else if (cmd === "status") {
+        const state = watching
+          ? `${GREEN}WATCHING${R}`
+          : `${RED}IDLE${R}`;
+        log(`Status: ${state}  |  Transfers: ${transfers}  |  Targets: ${receivers.join(", ")}`, CYAN);
+      } else if (cmd === "q") {
+        stopWatching();
+        log("Goodbye.", SUBTLE);
+        rl.close();
+        return;
+      } else if (cmd === "help") {
+        console.log(`  ${GREEN}s${R}      — start watching`);
+        console.log(`  ${RED}stop${R}   — stop watching`);
+        console.log(`  ${CYAN}status${R} — show current status`);
+        console.log(`  ${RED}q${R}      — quit`);
+      } else if (cmd !== "") {
+        log(`Unknown command '${cmd}'. Type 'help' for commands.`, SUBTLE);
+      }
+
+      prompt();
+    });
+  };
+
+  prompt();
+}
+
+main().catch(e => { console.error(e); process.exit(1); });
