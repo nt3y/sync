@@ -1,93 +1,61 @@
 #!/usr/bin/env bash
-# LoL Game Relay — SENDER (macOS) — NO DEPENDENCIES
-# Watches for League of Legends game process, captures launch args + env,
-# sends over TCP to Windows receiver, then kills local process.
-# Requirements: macOS with bash 3.2+ (pre-installed), no extra installs needed.
+# LoL Game Relay — SENDER (macOS) — NO EXTRA DEPENDENCIES
+# Uses only tools built into macOS: bash, ps, lsof, awk, python3 (pre-installed)
 
-# ── Config ────────────────────────────────────────────────────────────────────
 DEFAULT_RECEIVER_IP="192.168.1.XXX"
 DEFAULT_RECEIVER_PORT="54321"
 POLL_INTERVAL=1
 CMDLINE_WAIT_TIMEOUT=10
 MIN_ARGS=5
 
-# ── Colors ────────────────────────────────────────────────────────────────────
 RESET="\033[0m"; BOLD="\033[1m"; RED="\033[91m"; GREEN="\033[92m"
 YELLOW="\033[93m"; CYAN="\033[96m"; GOLD="\033[33m"; SUBTLE="\033[90m"; WHITE="\033[97m"
 
-# ── State ─────────────────────────────────────────────────────────────────────
 WATCHING=0
 TRANSFERS=0
 declare -A SEEN_PIDS
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 log() {
-    local msg="$1" color="${2:-}" bold="${3:-}"
     local ts; ts=$(date +%H:%M:%S)
-    local style="${bold:+$BOLD}${color}"
-    printf "${SUBTLE}[%s]${RESET}  ${style}%s${RESET}\n" "$ts" "$msg"
+    local style="${3:+$BOLD}${2:-}"
+    printf "${SUBTLE}[%s]${RESET}  ${style}%s${RESET}\n" "$ts" "$1"
 }
 
 banner() {
     echo
     printf "${GOLD}${BOLD}%s${RESET}\n" "========================================================"
-    printf "${GOLD}${BOLD}  ⚡  LoL RELAY  ·  SENDER  [macOS]  —  SHELL${RESET}\n"
+    printf "${GOLD}${BOLD}  ⚡  LoL RELAY  ·  SENDER  [macOS]${RESET}\n"
     printf "${GOLD}${BOLD}%s${RESET}\n" "========================================================"
     printf "${SUBTLE}  Host: %s${RESET}\n" "$(hostname)"
     echo
 }
 
-# ── Process helpers ───────────────────────────────────────────────────────────
 find_game_pids() {
-    # Returns PIDs of LoL game process (not client/launcher)
     ps aux 2>/dev/null | awk '
-    tolower($0) ~ /leagueoflegends/ &&
-    tolower($0) !~ /leagueclient/ &&
-    tolower($0) !~ /leagueclientux/ &&
-    tolower($0) !~ /riotclientservices/ &&
-    tolower($0) !~ /riotclientux/ &&
-    tolower($0) !~ /patcher/ &&
-    tolower($0) !~ /crashhandler/ &&
-    $0 !~ /awk/ &&
-    $0 !~ /lol_sender/ {print $2}'
+        tolower($0) ~ /leagueoflegends/ &&
+        tolower($0) !~ /leagueclient/ &&
+        tolower($0) !~ /leagueclientux/ &&
+        tolower($0) !~ /riotclientservices/ &&
+        tolower($0) !~ /riotclientux/ &&
+        tolower($0) !~ /patcher/ &&
+        tolower($0) !~ /crashhandler/ &&
+        $0 !~ /awk/ &&
+        $0 !~ /lol_sender/ {print $2}'
 }
 
-get_cmdline() {
-    local pid="$1"
-    # macOS: use ps to get full command line
-    ps -p "$pid" -o command= 2>/dev/null
-}
-
-get_exe() {
-    local pid="$1"
-    ps -p "$pid" -o comm= 2>/dev/null
-}
-
-get_cwd() {
-    local pid="$1"
-    # lsof can get cwd on macOS
-    lsof -p "$pid" -a -d cwd -Fn 2>/dev/null | awk '/^n/{sub(/^n/,""); print; exit}'
-}
-
-count_args() {
-    # Count space-separated tokens in cmdline (rough)
-    local cmdline="$1"
-    echo "$cmdline" | awk '{print NF}'
-}
+get_cmdline() { ps -p "$1" -o command= 2>/dev/null; }
+get_exe()     { ps -p "$1" -o comm=    2>/dev/null; }
+get_cwd()     { lsof -p "$1" -a -d cwd -Fn 2>/dev/null | awk '/^n/{sub(/^n/,""); print; exit}'; }
+count_args()  { echo "$1" | awk '{print NF}'; }
 
 wait_for_full_cmdline() {
     local pid="$1"
     local deadline=$((SECONDS + CMDLINE_WAIT_TIMEOUT))
-    local cmdline arg_count
-
     while [[ $SECONDS -lt $deadline ]]; do
-        cmdline=$(get_cmdline "$pid")
-        arg_count=$(count_args "$cmdline")
-        if [[ $arg_count -ge $MIN_ARGS ]]; then
-            echo "$cmdline"
-            return 0
-        fi
-        log "  Waiting for args … ($arg_count so far)" "$SUBTLE"
+        local cmdline; cmdline=$(get_cmdline "$pid")
+        local n; n=$(count_args "$cmdline")
+        if [[ $n -ge $MIN_ARGS ]]; then echo "$cmdline"; return 0; fi
+        log "  Waiting for args … ($n so far)" "$SUBTLE"
         sleep 0.3
     done
     return 1
@@ -95,184 +63,132 @@ wait_for_full_cmdline() {
 
 kill_process() {
     local pid="$1"
-    if ! kill -0 "$pid" 2>/dev/null; then
-        echo "already gone"
-        return
-    fi
-    if kill -TERM "$pid" 2>/dev/null; then
-        local i
-        for i in $(seq 1 10); do
-            sleep 0.5
-            kill -0 "$pid" 2>/dev/null || { echo "SIGTERM — graceful"; return; }
-        done
-    fi
-    if kill -KILL "$pid" 2>/dev/null; then
+    kill -0 "$pid" 2>/dev/null || { echo "already gone"; return; }
+    kill -TERM "$pid" 2>/dev/null
+    for _ in $(seq 1 10); do
         sleep 0.5
-        echo "SIGKILL — forced"
-    else
-        # Try sudo if permission denied
-        if sudo kill -9 "$pid" 2>/dev/null; then
-            echo "killed via sudo kill -9"
-        else
-            echo "ACCESS DENIED — try: sudo bash lol_sender.sh"
-        fi
-    fi
+        kill -0 "$pid" 2>/dev/null || { echo "SIGTERM — graceful"; return; }
+    done
+    kill -KILL "$pid" 2>/dev/null && { echo "SIGKILL — forced"; return; }
+    sudo kill -9 "$pid" 2>/dev/null && { echo "killed via sudo"; return; }
+    echo "ACCESS DENIED — try: sudo bash lol_sender.sh"
 }
 
-# ── JSON builder (no jq needed) ───────────────────────────────────────────────
-json_escape() {
-    # Escape a string for JSON
-    local s="$1"
-    s="${s//\\/\\\\}"   # backslash
-    s="${s//\"/\\\"}"   # double quote
-    s="${s//$'\n'/\\n}" # newline
-    s="${s//$'\r'/\\r}" # carriage return
-    s="${s//$'\t'/\\t}" # tab
-    echo "$s"
-}
-
-build_json() {
-    local pid="$1" name="$2" exe="$3" cmdline="$4" cwd="$5"
-    local esc_name esc_exe esc_cmdline esc_cwd
-    esc_name=$(json_escape "$name")
-    esc_exe=$(json_escape "$exe")
-    esc_cmdline=$(json_escape "$cmdline")
-    esc_cwd=$(json_escape "$cwd")
-
-    # Build cmdline JSON array from space-separated args
-    local args_json="["
-    local first=1
-    # Use eval to split on spaces respecting quotes
-    while IFS= read -r arg; do
-        [[ -z "$arg" ]] && continue
-        local esc_arg; esc_arg=$(json_escape "$arg")
-        [[ $first -eq 0 ]] && args_json+=","
-        args_json+="\"${esc_arg}\""
-        first=0
-    done < <(echo "$cmdline" | tr ' ' '\n')
-    args_json+="]"
-
-    # Collect env vars for this process via /proc equivalent on macOS
-    # macOS doesn't expose /proc, use `ps eww` for env
-    local env_json="{}"
-    local env_raw
-    env_raw=$(ps eww -p "$pid" 2>/dev/null | tail -1)
-    if [[ -n "$env_raw" ]]; then
-        # Extract KEY=VALUE pairs after the command section
-        # ps eww output: cmd args   KEY=VAL KEY=VAL ...
-        # This is approximate — get env vars after first KEY= pattern
-        local env_section
-        env_section=$(echo "$env_raw" | grep -oE '[A-Z_][A-Z0-9_]*=[^ ]+' | head -50)
-        if [[ -n "$env_section" ]]; then
-            env_json="{"
-            local efirst=1
-            while IFS= read -r pair; do
-                [[ -z "$pair" ]] && continue
-                local k="${pair%%=*}"
-                local v="${pair#*=}"
-                local ek; ek=$(json_escape "$k")
-                local ev; ev=$(json_escape "$v")
-                [[ $efirst -eq 0 ]] && env_json+=","
-                env_json+="\"${ek}\":\"${ev}\""
-                efirst=0
-            done <<< "$env_section"
-            env_json+="}"
-        fi
-    fi
-
-    cat <<EOF
-{"pid":${pid},"name":"${esc_name}","exe":"${esc_exe}","cmdline":${args_json},"cwd":"${esc_cwd}","environ":${env_json}}
-EOF
-}
-
-# ── Network: send over TCP using /dev/tcp (bash built-in) ────────────────────
+# ── Send JSON using python3 (built-in on macOS, handles the 8-byte header correctly) ──
 send_payload() {
-    local ip="$1" port="$2" payload="$3"
-    local byte_len=${#payload}
+    local ip="$1" port="$2" json="$3"
+    python3 - "$ip" "$port" "$json" <<'PYEOF'
+import sys, socket, json as _json
 
-    # Encode length as 8-byte big-endian using printf + xxd trick
-    # We'll send length as a plain text prefix "LEN:<n>\n" since
-    # the receiver needs to be updated to match anyway.
-    # If your receiver expects the original 8-byte binary prefix, use python3 -c below.
+ip   = sys.argv[1]
+port = int(sys.argv[2])
+data = sys.argv[3].encode("utf-8")
 
-    # Try /dev/tcp first (bash built-in, works on macOS)
-    {
-        # Build the 8-byte big-endian length header the original receiver expects
-        # Use python3 (built-in on macOS) just for this one line
-        python3 -c "import sys; n=${byte_len}; sys.stdout.buffer.write(n.to_bytes(8,'big'))" 2>/dev/null
-        printf '%s' "$payload"
-    } > /dev/tcp/"$ip"/"$port" 2>/dev/null
-
-    local status=$?
-    if [[ $status -eq 0 ]]; then
-        echo "ok"
-    else
-        echo "fail"
-    fi
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(10)
+        s.connect((ip, port))
+        s.sendall(len(data).to_bytes(8, "big") + data)
+    print("ok")
+except ConnectionRefusedError:
+    print(f"fail:refused")
+except socket.timeout:
+    print("fail:timeout")
+except OSError as e:
+    print(f"fail:{e}")
+PYEOF
 }
 
-# ── Capture & relay ───────────────────────────────────────────────────────────
+# ── Collect process info and build JSON ───────────────────────────────────────
 capture_and_relay() {
     local pid="$1" ip="$2" port="$3"
-
     local name; name=$(get_exe "$pid")
-    log "Game process found:  PID=$pid  Name=$name" "$GREEN" "bold"
-    log "Waiting for process to fully load args (max ${CMDLINE_WAIT_TIMEOUT}s) …" "$YELLOW"
+
+    log "Game process found:  PID=$pid  Name=$name" "$GREEN" bold
+    log "Waiting for full args (max ${CMDLINE_WAIT_TIMEOUT}s) …" "$YELLOW"
 
     local cmdline
     if ! cmdline=$(wait_for_full_cmdline "$pid"); then
-        log "⚠  Timeout waiting for args — process may have exited or args are restricted." "$RED"
+        log "⚠  Timeout — process may have exited or args are restricted." "$RED"
         return
     fi
 
-    local arg_count; arg_count=$(count_args "$cmdline")
-    log "Args ready:  $arg_count tokens captured" "$GREEN"
+    local n; n=$(count_args "$cmdline")
+    log "Args ready: $n tokens" "$GREEN"
 
-    local exe; exe=$(get_exe "$pid")
-    local cwd; cwd=$(get_cwd "$pid")
-
-    log "── Launch Arguments ──" "$GOLD" "bold"
+    log "── Launch Arguments ──" "$GOLD" bold
     local i=0
     while IFS= read -r arg; do
         [[ -z "$arg" ]] && continue
-        local color="$WHITE"
-        [[ $i -eq 0 ]] && color="$GOLD"
-        log "  [$i]  $arg" "$color"
+        local c="$WHITE"; [[ $i -eq 0 ]] && c="$GOLD"
+        log "  [$i]  $arg" "$c"
         ((i++))
     done < <(echo "$cmdline" | tr ' ' '\n')
 
+    local exe;  exe=$(get_exe "$pid")
+    local cwd;  cwd=$(get_cwd "$pid")
+
+    # Build JSON using python3 for correct escaping
     local json
-    json=$(build_json "$pid" "$name" "$exe" "$cmdline" "$cwd")
+    json=$(python3 - "$pid" "$name" "$exe" "$cmdline" "$cwd" <<'PYEOF'
+import sys, json, subprocess, shlex
 
-    local json_len=${#json}
-    log "── JSON payload: $json_len bytes ──" "$SUBTLE"
+pid     = int(sys.argv[1])
+name    = sys.argv[2]
+exe     = sys.argv[3]
+cmdline = shlex.split(sys.argv[4])
+cwd     = sys.argv[5]
 
-    # Kill local process
+# Try to grab env from ps eww (approximate on macOS)
+environ = {}
+try:
+    out = subprocess.check_output(["ps", "eww", "-p", str(pid)], text=True, stderr=subprocess.DEVNULL)
+    for line in out.splitlines()[1:]:
+        for token in line.split():
+            if '=' in token:
+                k, _, v = token.partition('=')
+                if k.replace('_','').isalnum():
+                    environ[k] = v
+except Exception:
+    pass
+
+payload = {
+    "pid":     pid,
+    "name":    name,
+    "exe":     exe,
+    "cmdline": cmdline,
+    "cwd":     cwd,
+    "environ": environ,
+}
+print(json.dumps(payload))
+PYEOF
+)
+
+    log "── Payload: ${#json} bytes ──" "$SUBTLE"
+
     local kill_result; kill_result=$(kill_process "$pid")
     log "Local process killed: $kill_result" "$YELLOW"
 
-    # Send
     log "Sending to $ip:$port …" "$CYAN"
     local result; result=$(send_payload "$ip" "$port" "$json")
 
     if [[ "$result" == "ok" ]]; then
-        log "✓  Sent $json_len bytes to $ip:$port" "$GREEN" "bold"
+        log "✓  Sent ${#json} bytes to $ip:$port" "$GREEN" bold
         ((TRANSFERS++))
         log "Total transfers this session: $TRANSFERS" "$GREEN"
     else
-        log "✗  Failed to connect to $ip:$port — is the receiver running?" "$RED" "bold"
+        log "✗  Send failed — $result" "$RED" bold
+        log "    Check: is the receiver running? Is the IP/port correct?" "$RED"
     fi
 }
 
 # ── Watch loop ────────────────────────────────────────────────────────────────
 watch_loop() {
     local ip="$1" port="$2"
-    log "Watcher started — waiting for game …" "$YELLOW" "bold"
+    log "Watcher started — waiting for game …" "$YELLOW" bold
 
     while [[ $WATCHING -eq 1 ]]; do
-        local pids
-        pids=$(find_game_pids)
-
+        local pids; pids=$(find_game_pids)
         if [[ -n "$pids" ]]; then
             while IFS= read -r pid; do
                 [[ -z "$pid" ]] && continue
@@ -282,21 +198,15 @@ watch_loop() {
                 fi
             done <<< "$pids"
         fi
-
         sleep "$POLL_INTERVAL"
     done
-
     log "Watcher stopped." "$SUBTLE"
 }
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
 cleanup() {
-    WATCHING=0
-    echo
+    WATCHING=0; echo
     log "Interrupted — exiting." "$YELLOW"
-    # Kill any background subshells
-    kill 0 2>/dev/null
-    exit 0
+    kill 0 2>/dev/null; exit 0
 }
 trap cleanup SIGINT SIGTERM
 
@@ -305,15 +215,13 @@ banner
 
 printf "${GOLD}── Configuration ──────────────────────────────${RESET}\n"
 printf "${CYAN}Receiver IP  (Windows PC LAN IP)${RESET} [${SUBTLE}%s${RESET}]: " "$DEFAULT_RECEIVER_IP"
-read -r input_ip
-RECEIVER_IP="${input_ip:-$DEFAULT_RECEIVER_IP}"
+read -r input_ip;   RECEIVER_IP="${input_ip:-$DEFAULT_RECEIVER_IP}"
 
 printf "${CYAN}Receiver Port${RESET} [${SUBTLE}%s${RESET}]: " "$DEFAULT_RECEIVER_PORT"
-read -r input_port
-RECEIVER_PORT="${input_port:-$DEFAULT_RECEIVER_PORT}"
+read -r input_port; RECEIVER_PORT="${input_port:-$DEFAULT_RECEIVER_PORT}"
 
 echo
-log "Target:  $RECEIVER_IP:$RECEIVER_PORT" "$CYAN" "bold"
+log "Target:  $RECEIVER_IP:$RECEIVER_PORT" "$CYAN" bold
 log "Host:    $(hostname)" "$CYAN"
 echo
 
@@ -329,7 +237,6 @@ WATCH_PID=""
 while true; do
     printf "${GOLD}>${RESET} "
     read -r cmd
-
     case "$cmd" in
         s|start)
             if [[ $WATCHING -eq 1 ]]; then
@@ -339,8 +246,7 @@ while true; do
                 declare -A SEEN_PIDS=()
                 watch_loop "$RECEIVER_IP" "$RECEIVER_PORT" &
                 WATCH_PID=$!
-            fi
-            ;;
+            fi ;;
         stop)
             if [[ $WATCHING -eq 1 ]]; then
                 WATCHING=0
@@ -348,31 +254,21 @@ while true; do
                 WATCH_PID=""
             else
                 log "Not watching." "$SUBTLE"
-            fi
-            ;;
+            fi ;;
         status)
-            if [[ $WATCHING -eq 1 ]]; then
-                printf "${SUBTLE}[$(date +%H:%M:%S)]${RESET}  Status: ${GREEN}${BOLD}WATCHING${RESET}  |  Transfers: ${TRANSFERS}\n"
-            else
-                printf "${SUBTLE}[$(date +%H:%M:%S)]${RESET}  Status: ${RED}${BOLD}IDLE${RESET}  |  Transfers: ${TRANSFERS}\n"
-            fi
-            ;;
+            local_state="${RED}${BOLD}IDLE${RESET}"
+            [[ $WATCHING -eq 1 ]] && local_state="${GREEN}${BOLD}WATCHING${RESET}"
+            printf "${SUBTLE}[$(date +%H:%M:%S)]${RESET}  Status: ${local_state}  |  Transfers: ${TRANSFERS}\n" ;;
         help)
             printf "  ${GREEN}s${RESET}      — start watching\n"
             printf "  ${RED}stop${RESET}   — stop watching\n"
             printf "  ${CYAN}status${RESET} — show current status\n"
-            printf "  ${RED}q${RESET}      — quit\n"
-            ;;
+            printf "  ${RED}q${RESET}      — quit\n" ;;
         q|quit|exit)
             WATCHING=0
             [[ -n "$WATCH_PID" ]] && kill "$WATCH_PID" 2>/dev/null
-            log "Goodbye." "$SUBTLE"
-            break
-            ;;
-        "")
-            ;;
-        *)
-            log "Unknown command '$cmd'. Type 'help' for commands." "$SUBTLE"
-            ;;
+            log "Goodbye." "$SUBTLE"; break ;;
+        "") ;;
+        *) log "Unknown command '$cmd'. Type 'help'." "$SUBTLE" ;;
     esac
 done
