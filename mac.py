@@ -79,6 +79,17 @@ def default_log(msg: str, color: str = "", bold: bool = False) -> None:
     print(f"{SUBTLE}[{ts}]{RESET}  {style}{msg}{RESET}", flush=True)
 
 
+def get_local_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
 # ── Shared state ─────────────────────────────────────────────────────────────
 class AppState:
     def __init__(self) -> None:
@@ -104,17 +115,6 @@ class AppState:
 
 
 STATE = AppState()
-
-
-def get_local_ip() -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
 
 
 def json_escape(s: str) -> str:
