@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """
-Wise Mac Sender — terminal or tkinter
-=====================================
-• Shows up in Wise (Windows) receiver scan via LAN discovery
-• Sends game launch args in Wise-compatible format
-• Detects League Client (LCU) on macOS
-• Watches for LoL game process, kills locally, relays to receiver
+LoL Game Relay — SENDER (macOS) — TERMINAL VERSION
+====================================================
+• Watches for the League of Legends GAME process
+• Captures all launch args + env vars
+• Sends them over TCP to the Windows receiver (Wise.exe compatible)
+• Kills the local game process
+• Fully terminal-based with colored output
+• Reads account name, rank, and profile icon from League Client (LCU)
 
-Setup:  pip3 install psutil
-Run:    python3 wise_sender.py
-GUI:    python3 wise_sender.py --gui
+Dependencies:  pip3 install psutil
+Run:           python3 lol_sender_terminal.py
 """
 
-from __future__ import annotations
-
-import argparse
 import base64
 import json
 import os
-import platform
 import signal
 import socket
 import ssl
@@ -28,29 +25,32 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+import psutil
 
-try:
-    import psutil
-except ImportError:
-    print("Install dependency:  pip3 install psutil")
-    sys.exit(1)
+# ── ANSI Colors ───────────────────────────────────────────────────────────────
+RESET   = "\033[0m"
+BOLD    = "\033[1m"
+RED     = "\033[91m"
+GREEN   = "\033[92m"
+YELLOW  = "\033[93m"
+CYAN    = "\033[96m"
+GOLD    = "\033[33m"
+SUBTLE  = "\033[90m"
+WHITE   = "\033[97m"
 
-# ── Wise protocol (matches sound/wise-cpp) ───────────────────────────────────
-TCP_PORT = 54321
-DISCOVERY_PORT = 54322
-DISCOVERY_INTERVAL = 4.0
-POLL_INTERVAL = 1.0
-MIN_ARGS = 5
+# ── Defaults ──────────────────────────────────────────────────────────────────
+DEFAULT_RECEIVER_IP   = "192.168.1.XXX"
+DEFAULT_RECEIVER_PORT = 54321
+POLL_INTERVAL         = 1.0
+DDRAGON_VER           = "14.3.1"
+
+GAME_KEYWORDS    = ["leagueoflegends", "league of legends"]
+EXCLUDE_KEYWORDS = ["leagueclient", "leagueclientux", "riotclientservices",
+                    "riotclientux", "patcher", "crashhandler"]
+
+MIN_ARGS             = 5
 CMDLINE_WAIT_TIMEOUT = 10.0
-CMDLINE_POLL = 0.3
-DDRAGON_VER = "14.3.1"
-
-GAME_KEYWORDS = ["leagueoflegends", "league of legends"]
-EXCLUDE_KEYWORDS = [
-    "leagueclient", "leagueclientux", "riotclientservices",
-    "riotclientux", "patcher", "crashhandler",
-]
+CMDLINE_POLL         = 0.3
 
 LOCKFILE_PATHS = [
     "~/Library/Application Support/Riot Games/League of Legends/lockfile",
@@ -59,73 +59,55 @@ LOCKFILE_PATHS = [
     "/Applications/League of Legends.app/Contents/LoL/lockfile",
 ]
 
-# ── Terminal colors ───────────────────────────────────────────────────────────
-RESET = "\033[0m"
-BOLD = "\033[1m"
-RED = "\033[91m"
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-CYAN = "\033[96m"
-GOLD = "\033[33m"
-SUBTLE = "\033[90m"
-WHITE = "\033[97m"
+# ── Globals ───────────────────────────────────────────────────────────────────
+_watching  = False
+_seen_pids = set()
+_transfers = 0
+_lock      = threading.Lock()
+_stop      = threading.Event()
 
-LogFn = Callable[[str, str, bool], None]
+_receiver_ip   = DEFAULT_RECEIVER_IP
+_receiver_port = DEFAULT_RECEIVER_PORT
 
+_lcu_online   = False
+_lcu_summoner = ""
+_cached_profile = None
 
-def default_log(msg: str, color: str = "", bold: bool = False) -> None:
-    ts = time.strftime("%H:%M:%S")
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+def log(msg, color="", bold=False):
+    ts    = time.strftime("%H:%M:%S")
     style = (BOLD if bold else "") + color
     print(f"{SUBTLE}[{ts}]{RESET}  {style}{msg}{RESET}", flush=True)
 
 
-def get_local_ip() -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+def banner():
+    print(flush=True)
+    print(f"{GOLD}{BOLD}{'='*56}{RESET}")
+    print(f"{GOLD}{BOLD}  ⚡  LoL RELAY  ·  SENDER  [macOS]  —  TERMINAL{RESET}")
+    print(f"{GOLD}{BOLD}{'='*56}{RESET}")
+    print(f"{SUBTLE}  Host: {socket.gethostname()}{RESET}")
+    print(flush=True)
 
 
-# ── Shared state ─────────────────────────────────────────────────────────────
-class AppState:
-    def __init__(self) -> None:
-        self.hostname = socket.gethostname()
-        self.local_ip = get_local_ip()
-        self.my_id = f"{self.local_ip}:{TCP_PORT}"
-        self.watching = False
-        self.seen_pids: set[int] = set()
-        self.transfers = 0
-        self.receivers: Dict[str, dict] = {}
-        self.selected_receiver_id: Optional[str] = None
-        self.lcu_online = False
-        self.lcu_summoner = ""
-        self.lock = threading.Lock()
-        self._stop = threading.Event()
+def print_status(label, color):
+    print(f"\r{color}{BOLD}  ● STATUS: {label}{RESET}          ", flush=True)
 
-    def selected_receiver(self) -> Optional[dict]:
-        if self.selected_receiver_id and self.selected_receiver_id in self.receivers:
-            return self.receivers[self.selected_receiver_id]
-        if self.receivers:
-            return next(iter(self.receivers.values()))
+# ── LCU (League Client — name, rank, icon) ───────────────────────────────────
+
+def _extract_flag(text, prefix):
+    idx = text.find(prefix)
+    if idx == -1:
         return None
+    start = idx + len(prefix)
+    end = text.find(" ", start)
+    val = text[start:] if end == -1 else text[start:end]
+    return val.strip("\"'")
 
 
-STATE = AppState()
-
-
-def json_escape(s: str) -> str:
-    return json.dumps(s)[1:-1]
-
-
-# ── LCU (League Client) ─────────────────────────────────────────────────────
-
-def collect_lockfile_paths() -> List[Path]:
-    paths: List[Path] = []
-    seen: set[str] = set()
+def _collect_lockfile_paths():
+    paths = []
+    seen = set()
     base = Path.home() / "Library/Application Support/Riot Games"
     for pattern in LOCKFILE_PATHS:
         p = Path(os.path.expanduser(pattern))
@@ -143,7 +125,7 @@ def collect_lockfile_paths() -> List[Path]:
     return paths
 
 
-def parse_lockfile(path: Path) -> Optional[Tuple[int, str]]:
+def _parse_lockfile(path):
     try:
         parts = path.read_text(encoding="utf-8", errors="ignore").strip().split(":")
         if len(parts) < 5:
@@ -157,15 +139,19 @@ def parse_lockfile(path: Path) -> Optional[Tuple[int, str]]:
     return None
 
 
-def lcu_credentials_from_process() -> Optional[Tuple[int, str]]:
+def _lcu_credentials():
+    for path in _collect_lockfile_paths():
+        creds = _parse_lockfile(path)
+        if creds:
+            return creds
     for proc in psutil.process_iter(["pid", "name"]):
         try:
             name = (proc.info.get("name") or "").lower()
             if "leagueclient" not in name:
                 continue
             cmd = " ".join(proc.cmdline())
-            port = extract_flag(cmd, "--app-port=") or extract_flag(cmd, "-RiotClientPort=")
-            token = extract_flag(cmd, "--remoting-auth-token=") or extract_flag(
+            port = _extract_flag(cmd, "--app-port=") or _extract_flag(cmd, "-RiotClientPort=")
+            token = _extract_flag(cmd, "--remoting-auth-token=") or _extract_flag(
                 cmd, "-RiotClientAuthToken="
             )
             if port and token:
@@ -175,148 +161,130 @@ def lcu_credentials_from_process() -> Optional[Tuple[int, str]]:
     return None
 
 
-def extract_flag(text: str, prefix: str) -> Optional[str]:
-    idx = text.find(prefix)
-    if idx == -1:
+def _lcu_request(path):
+    creds = _lcu_credentials()
+    if not creds:
         return None
-    start = idx + len(prefix)
-    end = text.find(" ", start)
-    val = text[start:] if end == -1 else text[start:end]
-    return val.strip("\"'")
-
-
-def refresh_lcu() -> bool:
-    creds = None
-    for path in collect_lockfile_paths():
-        creds = parse_lockfile(path)
-        if creds:
-            break
-    if not creds:
-        creds = lcu_credentials_from_process()
-    if not creds:
-        STATE.lcu_online = False
-        STATE.lcu_summoner = ""
-        return False
-
     port, token = creds
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     auth = base64.b64encode(f"riot:{token}".encode()).decode()
     req = urllib.request.Request(
-        f"https://127.0.0.1:{port}/lol-summoner/v1/current-summoner",
+        f"https://127.0.0.1:{port}{path}",
         headers={"Authorization": f"Basic {auth}"},
     )
     try:
         with urllib.request.urlopen(req, context=ctx, timeout=4) as resp:
-            data = json.loads(resp.read().decode())
-        game = data.get("gameName") or data.get("displayName") or "Summoner"
-        tag = data.get("tagLine")
-        STATE.lcu_summoner = f"{game}#{tag}" if tag else game
-        STATE.lcu_online = True
-        return True
+            return json.loads(resp.read().decode())
     except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError):
-        STATE.lcu_online = False
-        STATE.lcu_summoner = ""
-        return False
+        return None
 
 
-def lcu_loop(log: LogFn = default_log) -> None:
+def _parse_rank(ranked_json):
+    if not ranked_json:
+        return "Unranked"
+    raw = json.dumps(ranked_json)
+    pos = raw.find("RANKED_SOLO_5x5")
+    if pos == -1:
+        return "Unranked"
+    chunk = raw[pos:]
+    tier = division = ""
+    for key in ("tier", "division"):
+        marker = f'"{key}"'
+        idx = chunk.find(marker)
+        if idx == -1:
+            continue
+        colon = chunk.find(":", idx)
+        q1 = chunk.find('"', colon + 1)
+        q2 = chunk.find('"', q1 + 1)
+        if q1 != -1 and q2 != -1:
+            val = chunk[q1 + 1:q2]
+            if key == "tier":
+                tier = val
+            else:
+                division = val
+    if not tier:
+        return "Unranked"
+    return tier if not division else f"{tier} {division}"
+
+
+def _get_local_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+
+
+def build_profile():
+    summoner = _lcu_request("/lol-summoner/v1/current-summoner")
+    if not summoner:
+        return None
+    ranked = _lcu_request("/lol-ranked/v1/current-ranked-stats")
+    icon_id = summoner.get("profileIconId") or 29
+    game = summoner.get("gameName") or summoner.get("displayName") or "Summoner"
+    tag = summoner.get("tagLine") or ""
+    name = f"{game}#{tag}" if tag else game
+    host_ip = _get_local_ip()
+    return {
+        "type": "profile",
+        "name": name,
+        "level": summoner.get("summonerLevel") or 0,
+        "rank": _parse_rank(ranked),
+        "discord": "WISEIT",
+        "meta": f"macOS Sender • {host_ip}:{DEFAULT_RECEIVER_PORT}",
+        "icon_url": (
+            f"https://ddragon.leagueoflegends.com/cdn/{DDRAGON_VER}/"
+            f"img/profileicon/{icon_id}.png"
+        ),
+        "platform": "darwin",
+        "host_ip": host_ip,
+    }
+
+
+def refresh_lcu():
+    global _lcu_online, _lcu_summoner, _cached_profile
+    profile = build_profile()
+    if profile:
+        _lcu_online = True
+        _lcu_summoner = profile["name"]
+        _cached_profile = profile
+        return True
+    _lcu_online = False
+    _lcu_summoner = ""
+    _cached_profile = None
+    return False
+
+
+def lcu_loop():
     last = False
-    while not STATE._stop.is_set():
+    last_sent = None
+    while not _stop.is_set():
         online = refresh_lcu()
         if online != last:
             last = online
             if online:
-                log(f"League Client online — {STATE.lcu_summoner}", GREEN, True)
+                log(f"League Client online — {_lcu_summoner}", GREEN, bold=True)
             else:
                 log("League Client offline", YELLOW)
-        time.sleep(2.5)
+        if online and _cached_profile:
+            key = (_cached_profile.get("name"), _cached_profile.get("rank"))
+            if key != last_sent:
+                ok, msg = send_payload(_cached_profile, _receiver_ip, _receiver_port)
+                if ok:
+                    log(f"Profile synced to Windows — {_lcu_summoner} ({_cached_profile['rank']})", CYAN)
+                    last_sent = key
+        time.sleep(3.0)
 
+# ── Process helpers ───────────────────────────────────────────────────────────
 
-# ── LAN discovery (Wise-compatible) ─────────────────────────────────────────
-
-def discovery_broadcast(sock: socket.socket) -> None:
-    payload = json.dumps(
-        {
-            "type": "wise_discover",
-            "id": STATE.my_id,
-            "name": f"{STATE.hostname} (host)",
-            "ip": STATE.local_ip,
-            "port": TCP_PORT,
-            "mode": "host",
-            "platform": "darwin",
-        },
-        separators=(",", ":"),
-    ).encode()
-    sock.sendto(payload, ("<broadcast>", DISCOVERY_PORT))
-
-
-def discovery_loop(log: LogFn = default_log) -> None:
-    recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    recv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    recv.bind(("", DISCOVERY_PORT))
-    recv.settimeout(0.25)
-
-    send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    send.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-    discovery_broadcast(send)
-    log(
-        f"LAN discovery active — you should appear in Wise scan as "
-        f"'{STATE.hostname} (host)'",
-        CYAN,
-    )
-    last_broadcast = time.time()
-
-    while not STATE._stop.is_set():
-        if time.time() - last_broadcast >= DISCOVERY_INTERVAL:
-            discovery_broadcast(send)
-            last_broadcast = time.time()
-        try:
-            data, _addr = recv.recvfrom(4096)
-            msg = json.loads(data.decode("utf-8", errors="ignore"))
-            if msg.get("type") != "wise_discover":
-                continue
-            device_id = msg.get("id") or ""
-            if not device_id or device_id == STATE.my_id:
-                continue
-            mode = (msg.get("mode") or "").lower()
-            if mode != "receiver":
-                continue
-            ip = msg.get("ip") or ""
-            port = int(msg.get("port") or TCP_PORT)
-            name = msg.get("name") or ip
-            with STATE.lock:
-                is_new = device_id not in STATE.receivers
-                STATE.receivers[device_id] = {
-                    "id": device_id,
-                    "name": name,
-                    "ip": ip,
-                    "port": port,
-                    "mode": mode,
-                    "platform": msg.get("platform") or "",
-                }
-                if not STATE.selected_receiver_id:
-                    STATE.selected_receiver_id = device_id
-            if is_new:
-                log(f"Receiver found: {name} @ {ip}:{port}", GREEN)
-        except socket.timeout:
-            pass
-        except (json.JSONDecodeError, ValueError, OSError):
-            pass
-
-    recv.close()
-    send.close()
-
-
-# ── Game watch & relay ───────────────────────────────────────────────────────
-
-def is_game_process(proc: psutil.Process) -> bool:
+def is_game_process(proc):
     try:
-        name = proc.name().lower()
-        exe = proc.exe().lower()
-        cmdline = " ".join(proc.cmdline()).lower()
+        name     = proc.name().lower()
+        exe      = proc.exe().lower()
+        cmdline  = " ".join(proc.cmdline()).lower()
         identity = f"{name} {exe} {cmdline}"
         if not any(k in identity for k in GAME_KEYWORDS):
             return False
@@ -327,208 +295,218 @@ def is_game_process(proc: psutil.Process) -> bool:
         return False
 
 
-def wait_for_full_cmdline(proc: psutil.Process) -> Tuple[List[str], float]:
+def wait_for_full_cmdline(proc):
     deadline = time.time() + CMDLINE_WAIT_TIMEOUT
-    start = time.time()
+    start    = time.time()
     while time.time() < deadline:
         try:
             cmdline = proc.cmdline()
             if len(cmdline) >= MIN_ARGS:
                 return cmdline, round(time.time() - start, 2)
+            log(f"  Waiting for args … ({len(cmdline)} so far)", SUBTLE)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             break
         time.sleep(CMDLINE_POLL)
     return [], CMDLINE_WAIT_TIMEOUT
 
 
-def kill_process(proc: psutil.Process) -> str:
+def collect_info(proc, full_cmdline):
+    info = {}
+    try:
+        info["pid"]     = proc.pid
+        info["name"]    = proc.name()
+        info["exe"]     = proc.exe()
+        info["cmdline"] = full_cmdline
+        info["cwd"]     = proc.cwd()
+        info["created"] = proc.create_time()
+        try:
+            info["environ"] = proc.environ()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            info["environ"] = {}
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+    return info
+
+
+def kill_process(proc):
+    import subprocess as _sp
     try:
         proc.terminate()
         proc.wait(timeout=5)
-        return "SIGTERM"
+        return "SIGTERM — graceful"
     except psutil.TimeoutExpired:
         try:
             proc.kill()
             proc.wait(timeout=5)
-            return "SIGKILL"
+            return "SIGKILL — forced"
         except Exception:
-            return "forced"
+            return "already gone after SIGKILL attempt"
     except psutil.NoSuchProcess:
         return "already gone"
     except psutil.AccessDenied:
-        return "access denied — try: sudo python3 wise_sender.py"
-
-
-def build_wise_payload(proc: psutil.Process, cmdline: List[str]) -> dict:
-    profile = None
-    if STATE.lcu_online and refresh_lcu():
         try:
-            creds = lcu_credentials_from_process() or parse_lockfile_from_disk()
-            if creds:
-                port, token = creds
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                auth = base64.b64encode(f"riot:{token}".encode()).decode()
-                req = urllib.request.Request(
-                    f"https://127.0.0.1:{port}/lol-summoner/v1/current-summoner",
-                    headers={"Authorization": f"Basic {auth}"},
-                )
-                with urllib.request.urlopen(req, context=ctx, timeout=4) as resp:
-                    s = json.loads(resp.read().decode())
-                icon_id = s.get("profileIconId") or 29
-                game = s.get("gameName") or s.get("displayName") or "Unknown"
-                tag = s.get("tagLine") or ""
-                name = f"{game}#{tag}" if tag else game
-                profile = {
-                    "type": "profile",
-                    "name": name,
-                    "level": s.get("summonerLevel") or 0,
-                    "rank": "Unranked",
-                    "discord": "WISEIT",
-                    "meta": f"macOS Sender • {STATE.local_ip}:{TCP_PORT}",
-                    "icon_url": (
-                        f"https://ddragon.leagueoflegends.com/cdn/{DDRAGON_VER}/"
-                        f"img/profileicon/{icon_id}.png"
-                    ),
-                    "platform": "darwin",
-                    "host_ip": STATE.local_ip,
-                }
-        except Exception:
-            profile = None
+            _sp.run(["sudo", "kill", "-9", str(proc.pid)],
+                    timeout=5, check=True, capture_output=True)
+            return f"killed via sudo kill -9 (PID {proc.pid})"
+        except Exception as e:
+            return f"ACCESS DENIED + sudo failed: {e}  → run:  sudo python3 lol_sender_terminal.py"
 
+# ── Network ───────────────────────────────────────────────────────────────────
+
+def send_payload(payload, ip, port):
+    try:
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(10)
+            s.connect((ip, port))
+            s.sendall(len(body).to_bytes(8, "big") + body)
+        return True, f"✓  Sent {len(body):,} bytes to {ip}:{port}"
+    except ConnectionRefusedError:
+        return False, f"✗  Connection refused — is Wise Receiver running on {ip}:{port}?"
+    except socket.timeout:
+        return False, f"✗  Timeout connecting to {ip}:{port}"
+    except OSError as e:
+        return False, f"✗  Network error: {e}"
+
+
+def build_wise_game_payload(info):
+    """Wise.exe (C++) expects type=game_launch + platform=darwin + cmdline."""
     payload = {
         "type": "game_launch",
         "platform": "darwin",
-        "pid": proc.pid,
-        "name": proc.name(),
-        "cmdline": cmdline,
+        "pid": info.get("pid"),
+        "name": info.get("name"),
+        "cmdline": info.get("cmdline", []),
     }
+    profile = _cached_profile or build_profile()
     if profile:
         payload["profile"] = profile
     return payload
 
+# ── Capture & relay ───────────────────────────────────────────────────────────
 
-def parse_lockfile_from_disk() -> Optional[Tuple[int, str]]:
-    for path in collect_lockfile_paths():
-        creds = parse_lockfile(path)
-        if creds:
-            return creds
-    return lcu_credentials_from_process()
+def capture_and_relay(proc, pid, name, ip, port):
+    global _transfers
 
+    log(f"Game process found:  PID={pid}  Name={name}", GREEN, bold=True)
+    log(f"Waiting for process to fully load args (max {CMDLINE_WAIT_TIMEOUT}s) …", YELLOW)
 
-def send_wise_payload(payload: dict, ip: str, port: int) -> Tuple[bool, str]:
-    try:
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(12)
-            s.connect((ip, port))
-            s.sendall(len(body).to_bytes(8, "big") + body)
-        return True, f"Sent {len(body):,} bytes → {ip}:{port}"
-    except ConnectionRefusedError:
-        return False, f"Connection refused — is Wise in Receiver mode on {ip}:{port}?"
-    except socket.timeout:
-        return False, f"Timeout connecting to {ip}:{port}"
-    except OSError as e:
-        return False, f"Network error: {e}"
-
-
-def capture_and_relay(proc: psutil.Process, pid: int, name: str, log: LogFn) -> None:
-    log(f"Game detected: PID={pid} {name}", GREEN, True)
     full_cmdline, elapsed = wait_for_full_cmdline(proc)
+
     if not full_cmdline:
-        log(f"No args captured within {CMDLINE_WAIT_TIMEOUT}s", RED)
+        log(f"⚠  Timeout waiting for args after {CMDLINE_WAIT_TIMEOUT}s — "
+            "process may have exited early or args are restricted.", RED)
         return
 
-    log(f"Captured {len(full_cmdline)} args in {elapsed}s", GREEN)
+    log(f"Args ready:  {len(full_cmdline)} tokens captured in {elapsed}s", GREEN)
+
+    info = collect_info(proc, full_cmdline)
+
+    # Print args
+    log("── Launch Arguments ──", GOLD, bold=True)
+    for i, arg in enumerate(full_cmdline):
+        color = GOLD if i == 0 else WHITE
+        log(f"  [{i:02d}]  {arg}", color)
+
+    env_count = len(info.get("environ", {}))
+    log(f"── Environment: {env_count} vars captured ──", SUBTLE)
+
+    # Kill
     kill_result = kill_process(proc)
-    log(f"Local game stopped ({kill_result})", YELLOW)
+    log(f"Local process killed: {kill_result}", YELLOW)
 
-    receiver = STATE.selected_receiver()
-    if not receiver:
-        log("No Wise receiver on LAN — open Wise on Windows in Receiver mode", RED, True)
-        return
+    # Send (Wise.exe compatible)
+    wise_payload = build_wise_game_payload(info)
+    if wise_payload.get("profile"):
+        p = wise_payload["profile"]
+        log(f"Profile attached: {p['name']} · {p['rank']}", CYAN)
+    log(f"Sending to {ip}:{port} …", CYAN)
+    ok, msg = send_payload(wise_payload, ip, port)
+    log(msg, GREEN if ok else RED, bold=True)
 
-    ip, port = receiver["ip"], int(receiver["port"])
-    payload = build_wise_payload(proc, full_cmdline)
-    log(f"Relaying to {receiver['name']} ({ip}:{port}) …", CYAN)
-    ok, msg = send_wise_payload(payload, ip, port)
-    log(msg, GREEN if ok else RED, True)
     if ok:
-        with STATE.lock:
-            STATE.transfers += 1
-            log(f"Session transfers: {STATE.transfers}", GREEN)
+        with _lock:
+            _transfers += 1
+            log(f"Total transfers this session: {_transfers}", GREEN)
 
+# ── Watch loop ────────────────────────────────────────────────────────────────
 
-def watch_loop(log: LogFn = default_log) -> None:
-    log("Watching for game launch …", YELLOW, True)
-    while STATE.watching and not STATE._stop.is_set():
-        receiver = STATE.selected_receiver()
-        if not receiver:
-            log("Waiting for a Wise receiver on the network …", SUBTLE)
+def watch_loop(ip, port):
+    global _watching, _seen_pids
+    log("Watcher started — waiting for game …", YELLOW, bold=True)
+    print_status("WATCHING", YELLOW)
+
+    while _watching:
         for proc in psutil.process_iter(["pid", "name"]):
-            if not STATE.watching:
+            if not _watching:
                 break
-            if proc.pid in STATE.seen_pids:
+            if proc.pid in _seen_pids:
                 continue
             if is_game_process(proc):
-                STATE.seen_pids.add(proc.pid)
+                _seen_pids.add(proc.pid)
+                pid_snap  = proc.pid
+                name_snap = proc.name()
                 threading.Thread(
                     target=capture_and_relay,
-                    args=(proc, proc.pid, proc.name(), log),
-                    daemon=True,
+                    args=(proc, pid_snap, name_snap, ip, port),
+                    daemon=True
                 ).start()
         time.sleep(POLL_INTERVAL)
 
+    log("Watcher stopped.", SUBTLE)
+    print_status("IDLE", RED)
 
-# ── Terminal UI ──────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-def print_receivers(log: LogFn = default_log) -> None:
-    with STATE.lock:
-        items = list(STATE.receivers.values())
-        sel = STATE.selected_receiver_id
-    if not items:
-        log("No receivers yet — start Wise on Windows in Receiver mode", YELLOW)
-        return
-    log("Receivers (link to this Mac in Wise scan, args go here):", GOLD, True)
-    for i, d in enumerate(items, 1):
-        mark = " ← active" if d["id"] == sel else ""
-        log(f"  [{i}] {d['name']}  {d['ip']}:{d['port']}{mark}", WHITE)
+def get_input(prompt, default):
+    try:
+        val = input(f"{CYAN}{prompt}{RESET} [{SUBTLE}{default}{RESET}]: ").strip()
+        return val if val else default
+    except EOFError:
+        return default
 
 
-def banner() -> None:
-    print()
-    print(f"{GOLD}{BOLD}{'=' * 58}{RESET}")
-    print(f"{GOLD}{BOLD}  Wise Mac Sender  ·  compatible with Wise Windows receiver{RESET}")
-    print(f"{GOLD}{BOLD}{'=' * 58}{RESET}")
-    print(f"{SUBTLE}  Host: {STATE.hostname}  IP: {STATE.local_ip}{RESET}")
-    print(f"{SUBTLE}  Appears in Wise scan as: {STATE.hostname} (host){RESET}")
-    print()
+def main():
+    global _watching, _seen_pids, _transfers, _receiver_ip, _receiver_port
 
-
-def run_terminal() -> None:
     banner()
-    STATE._stop.clear()
-    threading.Thread(target=discovery_loop, daemon=True).start()
+
+    # Config
+    print(f"{GOLD}── Configuration ──────────────────────────────{RESET}")
+    _receiver_ip = get_input("Receiver IP  (Windows PC LAN IP)", DEFAULT_RECEIVER_IP)
+    receiver_port_str = get_input("Receiver Port", str(DEFAULT_RECEIVER_PORT))
+    try:
+        _receiver_port = int(receiver_port_str)
+    except ValueError:
+        print(f"{RED}Invalid port, using default {DEFAULT_RECEIVER_PORT}{RESET}")
+        _receiver_port = DEFAULT_RECEIVER_PORT
+
+    print()
+    log(f"Target:  {_receiver_ip}:{_receiver_port}", CYAN, bold=True)
+    log(f"Host:    {socket.gethostname()}", CYAN)
+    log("Wise.exe: set Windows app to Receiver mode", SUBTLE)
+    print()
+
+    _stop.clear()
     threading.Thread(target=lcu_loop, daemon=True).start()
 
-    print(f"{GOLD}Commands:{RESET}")
-    print(f"  {GREEN}s{RESET}        start watching for game")
-    print(f"  {RED}stop{RESET}     stop watching")
-    print(f"  {CYAN}status{RESET}   LCU + receiver status")
-    print(f"  {CYAN}list{RESET}     list discovered receivers")
-    print(f"  {CYAN}use N{RESET}    pick receiver #N from list")
-    print(f"  {RED}q{RESET}        quit")
-    print()
-
-    def on_sigint(_s, _f):
-        STATE.watching = False
-        STATE._stop.set()
+    # Signal handler for clean Ctrl+C exit
+    def _sigint(sig, frame):
+        global _watching
         print()
-        log("Bye.", SUBTLE)
+        log("Interrupt received — stopping …", YELLOW)
+        _watching = False
+        _stop.set()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, on_sigint)
+    signal.signal(signal.SIGINT, _sigint)
+
+    # Interactive command loop
+    print(f"{GOLD}── Commands ────────────────────────────────────{RESET}")
+    print(f"  {GREEN}s{RESET} → Start watching")
+    print(f"  {RED}q{RESET} → Quit")
+    print(f"  {SUBTLE}Press Ctrl+C at any time to exit{RESET}")
+    print()
 
     while True:
         try:
@@ -537,161 +515,50 @@ def run_terminal() -> None:
             break
 
         if cmd == "s":
-            if STATE.watching:
-                log("Already watching", YELLOW)
+            if _watching:
+                log("Already watching!", YELLOW)
             else:
-                STATE.watching = True
-                STATE.seen_pids.clear()
-                threading.Thread(target=watch_loop, daemon=True).start()
-
-        elif cmd == "stop":
-            STATE.watching = False
-            log("Watcher stopped", SUBTLE)
-
-        elif cmd == "status":
-            lcu = f"{GREEN}online{RESET} ({STATE.lcu_summoner})" if STATE.lcu_online else f"{RED}offline{RESET}"
-            watch = f"{GREEN}watching{RESET}" if STATE.watching else f"{RED}idle{RESET}"
-            rcv = STATE.selected_receiver()
-            rcv_txt = f"{rcv['name']} @ {rcv['ip']}" if rcv else "none yet"
-            print(f"  LCU: {lcu}  |  Watcher: {watch}  |  Target: {rcv_txt}  |  Sends: {STATE.transfers}")
-
-        elif cmd in ("list", "receivers"):
-            print_receivers()
-
-        elif cmd.startswith("use "):
-            try:
-                idx = int(cmd.split()[1]) - 1
-                with STATE.lock:
-                    items = list(STATE.receivers.values())
-                if 0 <= idx < len(items):
-                    STATE.selected_receiver_id = items[idx]["id"]
-                    log(f"Active receiver: {items[idx]['name']}", GREEN)
-                else:
-                    log("Invalid number — run 'list' first", RED)
-            except (IndexError, ValueError):
-                log("Usage: use 1", YELLOW)
+                _watching  = True
+                _seen_pids = set()
+                t = threading.Thread(
+                    target=watch_loop,
+                    args=(_receiver_ip, _receiver_port),
+                    daemon=True,
+                )
+                t.start()
 
         elif cmd == "q":
-            STATE.watching = False
-            STATE._stop.set()
-            log("Bye.", SUBTLE)
+            _watching = False
+            _stop.set()
+            log("Goodbye.", SUBTLE)
             break
 
+        elif cmd == "stop":
+            if _watching:
+                _watching = False
+            else:
+                log("Not watching.", SUBTLE)
+
+        elif cmd == "status":
+            state = f"{GREEN}WATCHING{RESET}" if _watching else f"{RED}IDLE{RESET}"
+            lcu = (
+                f"{GREEN}{_lcu_summoner}{RESET}"
+                if _lcu_online
+                else f"{RED}offline{RESET}"
+            )
+            log(f"Status: {state}  |  LCU: {lcu}  |  Transfers: {_transfers}", CYAN)
+
         elif cmd == "help":
-            log("s | stop | status | list | use N | q", SUBTLE)
+            print(f"  {GREEN}s{RESET}      — start watching")
+            print(f"  {RED}stop{RESET}   — stop watching")
+            print(f"  {CYAN}status{RESET} — show current status")
+            print(f"  {RED}q{RESET}      — quit")
 
-        elif cmd:
-            log("Unknown command — type help", SUBTLE)
+        elif cmd == "":
+            pass  # ignore empty
 
-
-# ── Tkinter GUI ──────────────────────────────────────────────────────────────
-
-def run_gui() -> None:
-    import tkinter as tk
-    from tkinter import scrolledtext, ttk
-
-    STATE._stop.clear()
-    root = tk.Tk()
-    root.title("Wise Mac Sender")
-    root.geometry("620x480")
-    root.configure(bg="#1a1a1a")
-
-    def gui_log(msg: str, _color: str = "", _bold: bool = False) -> None:
-        def append() -> None:
-            log_box.configure(state="normal")
-            log_box.insert("end", f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-            log_box.see("end")
-            log_box.configure(state="disabled")
-
-        root.after(0, append)
-
-    def refresh_status() -> None:
-        lcu_lbl.configure(
-            text=f"League Client: {'Online — ' + STATE.lcu_summoner if STATE.lcu_online else 'Offline'}"
-        )
-        watch_lbl.configure(text=f"Watcher: {'Running' if STATE.watching else 'Stopped'}")
-        scan_lbl.configure(text=f"Scan name: {STATE.hostname} (host)  ·  IP: {STATE.local_ip}")
-        rcv = STATE.selected_receiver()
-        target_lbl.configure(text=f"Receiver: {rcv['name'] + ' @ ' + rcv['ip'] if rcv else 'Waiting…'}")
-        recv_list.delete(0, "end")
-        with STATE.lock:
-            for d in STATE.receivers.values():
-                mark = " *" if d["id"] == STATE.selected_receiver_id else ""
-                recv_list.insert("end", f"{d['name']}  ({d['ip']}){mark}")
-        root.after(1500, refresh_status)
-
-    def start_watch() -> None:
-        if not STATE.watching:
-            STATE.watching = True
-            STATE.seen_pids.clear()
-            threading.Thread(target=watch_loop, args=(gui_log,), daemon=True).start()
-            gui_log("Watcher started")
-
-    def stop_watch() -> None:
-        STATE.watching = False
-        gui_log("Watcher stopped")
-
-    def on_pick(_evt=None) -> None:
-        sel = recv_list.curselection()
-        if not sel:
-            return
-        with STATE.lock:
-            items = list(STATE.receivers.values())
-        if sel[0] < len(items):
-            STATE.selected_receiver_id = items[sel[0]]["id"]
-            gui_log(f"Selected receiver: {items[sel[0]]['name']}")
-
-    def on_close() -> None:
-        STATE.watching = False
-        STATE._stop.set()
-        root.destroy()
-
-    frm = ttk.Frame(root, padding=10)
-    frm.pack(fill="both", expand=True)
-
-    scan_lbl = ttk.Label(frm, text="", font=("Helvetica", 10, "bold"))
-    scan_lbl.pack(anchor="w")
-    lcu_lbl = ttk.Label(frm, text="League Client: …")
-    lcu_lbl.pack(anchor="w", pady=(4, 0))
-    watch_lbl = ttk.Label(frm, text="Watcher: Stopped")
-    watch_lbl.pack(anchor="w")
-    target_lbl = ttk.Label(frm, text="Receiver: …")
-    target_lbl.pack(anchor="w", pady=(0, 8))
-
-    ttk.Label(frm, text="Wise receivers on LAN (Windows app in Receiver mode):").pack(anchor="w")
-    recv_list = tk.Listbox(frm, height=4, bg="#111", fg="#ddd", selectbackground="#333")
-    recv_list.pack(fill="x", pady=4)
-    recv_list.bind("<<ListboxSelect>>", on_pick)
-
-    btn_row = ttk.Frame(frm)
-    btn_row.pack(fill="x", pady=6)
-    ttk.Button(btn_row, text="Start watch", command=start_watch).pack(side="left", padx=(0, 6))
-    ttk.Button(btn_row, text="Stop", command=stop_watch).pack(side="left")
-
-    log_box = scrolledtext.ScrolledText(frm, height=14, bg="#0d0d0d", fg="#ccc", font=("Menlo", 10))
-    log_box.pack(fill="both", expand=True, pady=(8, 0))
-    log_box.configure(state="disabled")
-
-    threading.Thread(target=discovery_loop, args=(gui_log,), daemon=True).start()
-    threading.Thread(target=lcu_loop, args=(gui_log,), daemon=True).start()
-    gui_log("Discovery started — you appear in Wise Windows scan")
-    refresh_status()
-    root.protocol("WM_WINDOW_CLOSE", on_close)
-    root.mainloop()
-
-
-def main() -> None:
-    if platform.system() != "Darwin":
-        print("This script is for macOS (League Client + game paths).")
-
-    parser = argparse.ArgumentParser(description="Wise Mac Sender")
-    parser.add_argument("--gui", action="store_true", help="Open classic tkinter window")
-    args = parser.parse_args()
-
-    if args.gui:
-        run_gui()
-    else:
-        run_terminal()
+        else:
+            log(f"Unknown command '{cmd}'. Type 'help' for commands.", SUBTLE)
 
 
 if __name__ == "__main__":
